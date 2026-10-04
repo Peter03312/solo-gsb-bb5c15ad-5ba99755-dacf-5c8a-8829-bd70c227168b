@@ -210,6 +210,36 @@ function init(dbPath) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_stockitems_st ON stocktake_items(stocktake_id);
+
+    -- 领料出库：工作室按已确认的独立铅条计划、独立裁片订单或整套用料单分次领料。
+    -- 确认时在同一事务内扣减“实物库存”与对应单据的“预留剩余”，领料记录永久不可变。
+    -- doc_type='plan'（独立铅条计划，doc_id=lead_plans.id）；
+    -- doc_type='order'（独立裁片订单，doc_id=cut_orders.id）；
+    -- doc_type='combo'（整套用料单，doc_id=combo_orders.id，允许只领其中一类）。
+    -- code 为全局唯一领料号（客户端幂等键）：同号同内容重试返回原记录，同号不同内容冲突。
+    CREATE TABLE IF NOT EXISTS requisitions (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      code         TEXT    NOT NULL UNIQUE,            -- 唯一领料号
+      doc_type     TEXT    NOT NULL CHECK (doc_type IN ('plan','order','combo')),
+      doc_id       INTEGER NOT NULL,
+      lead_bars    INTEGER NOT NULL DEFAULT 0 CHECK (lead_bars >= 0),
+      glass_sheets INTEGER NOT NULL DEFAULT 0 CHECK (glass_sheets >= 0),
+      created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_requisitions_doc ON requisitions(doc_type, doc_id);
+
+    -- 裁片领料分色明细：每次领料实际领出的各颜色原片张数（不可变记录）。
+    CREATE TABLE IF NOT EXISTS requisition_glass_items (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      requisition_id INTEGER NOT NULL REFERENCES requisitions(id),
+      sheet_id       INTEGER NOT NULL,
+      sheet_color    TEXT    NOT NULL,
+      sheets         INTEGER NOT NULL CHECK (sheets >= 0)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_reqitems_req   ON requisition_glass_items(requisition_id);
+    CREATE INDEX IF NOT EXISTS idx_reqitems_sheet ON requisition_glass_items(sheet_id);
   `);
 
   // 旧库迁移：早期 cut_orders 的状态 CHECK 不含 'replaced'，也没有 replaced_at 列。
@@ -439,8 +469,8 @@ function rowToMaterial(row) {
   };
 }
 
-// 各规格当前已被已确认计划预留的根数
-function reservedMap() {
+// 各规格当前已被已确认计划预留的根数（毛预留，含已领出部分）
+function leadGrossReservedMap() {
   const rows = getDb()
     .prepare(`SELECT material_id AS id, COALESCE(SUM(required_bars), 0) AS reserved
               FROM lead_plans WHERE status = 'confirmed' GROUP BY material_id`)
@@ -450,16 +480,104 @@ function reservedMap() {
   return m;
 }
 
+// ---------- 领料出库统计（实物库存与预留各扣减一次） ----------
+
+// 某张已确认单据（独立铅条计划/整套单）已领出的铅条根数
+function leadDrawnForDoc(docType, docId) {
+  return getDb()
+    .prepare('SELECT COALESCE(SUM(lead_bars),0) AS n FROM requisitions WHERE doc_type = ? AND doc_id = ?')
+    .get(docType, docId).n;
+}
+
+// 某规格铅条已从全部已确认单据领出的根数（独立计划 + 整套单）
+function leadDrawnForMaterialMap() {
+  const m = new Map();
+  const planRows = getDb()
+    .prepare(`SELECT p.material_id AS id, COALESCE(SUM(r.lead_bars),0) AS drawn
+              FROM requisitions r JOIN lead_plans p
+                ON p.id = r.doc_id AND p.status = 'confirmed'
+              WHERE r.doc_type = 'plan' AND r.lead_bars > 0
+              GROUP BY p.material_id`).all();
+  for (const r of planRows) m.set(r.id, (m.get(r.id) || 0) + r.drawn);
+  const comboRows = getDb()
+    .prepare(`SELECT c.material_id AS id, COALESCE(SUM(r.lead_bars),0) AS drawn
+              FROM requisitions r JOIN combo_orders c
+                ON c.id = r.doc_id AND c.status = 'confirmed'
+              WHERE r.doc_type = 'combo' AND r.lead_bars > 0
+              GROUP BY c.material_id`).all();
+  for (const r of comboRows) m.set(r.id, (m.get(r.id) || 0) + r.drawn);
+  return m;
+}
+
+function leadGrossReservedFor(materialId) {
+  return getDb()
+    .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
+    .get(materialId).n;
+}
+
+// 某张已确认裁片订单已领出的各色原片张数，返回 Map(sheetId -> sheets)。
+// 独立订单：requisitions(doc_type='order', doc_id=订单id)；
+// 整套关联订单：requisitions(doc_type='combo', doc_id=整套单id)，经 combo_orders.cut_order_id 定位。
+function glassDrawnForOrderMap(orderId) {
+  const rows = getDb()
+    .prepare(`SELECT i.sheet_id AS id, COALESCE(SUM(i.sheets),0) AS drawn
+              FROM requisition_glass_items i
+              JOIN requisitions r ON r.id = i.requisition_id
+              WHERE i.sheets > 0 AND (
+                (r.doc_type = 'order' AND r.doc_id = ?)
+                OR (r.doc_type = 'combo' AND r.doc_id =
+                    (SELECT c.id FROM combo_orders c WHERE c.cut_order_id = ? AND c.status = 'confirmed'))
+              )
+              GROUP BY i.sheet_id`).all(orderId, orderId);
+  const m = new Map();
+  for (const r of rows) m.set(r.id, r.drawn);
+  return m;
+}
+
+// 某颜色原片已从全部已确认单据（独立订单 + 整套关联订单）领出的张数
+function glassDrawnForSheetMap() {
+  const rows = getDb()
+    .prepare(`SELECT i.sheet_id AS id, COALESCE(SUM(i.sheets),0) AS drawn
+              FROM requisition_glass_items i
+              JOIN requisitions r ON r.id = i.requisition_id
+              JOIN cut_orders o ON o.status = 'confirmed' AND (
+                (r.doc_type = 'order' AND o.id = r.doc_id)
+                OR (r.doc_type = 'combo' AND o.id =
+                    (SELECT c.cut_order_id FROM combo_orders c WHERE c.id = r.doc_id AND c.status = 'confirmed'))
+              )
+              WHERE i.sheets > 0
+              GROUP BY i.sheet_id`).all();
+  const m = new Map();
+  for (const r of rows) m.set(r.id, r.drawn);
+  return m;
+}
+
+// 有效预留 = 毛预留 − 已领出（领出部分已转为实物消耗，不再占用可用量）
+function leadEffectiveReserved(materialId) {
+  return leadGrossReservedFor(materialId) - (leadDrawnForMaterialMap().get(materialId) || 0);
+}
+
+// 各规格当前有效预留根数（毛预留 − 已领出）
+function reservedMap() {
+  const gross = leadGrossReservedMap();
+  const drawn = leadDrawnForMaterialMap();
+  const m = new Map();
+  for (const [id, g] of gross) m.set(id, g - (drawn.get(id) || 0));
+  return m;
+}
+
 function listMaterials() {
-  const reserved = reservedMap();
+  const gross = leadGrossReservedMap();
+  const drawnMap = leadDrawnForMaterialMap();
   return getDb()
     .prepare('SELECT * FROM lead_materials ORDER BY id')
     .all()
     .map((r) => {
       const m = rowToMaterial(r);
-      const used = reserved.get(r.id) || 0;
-      m.reserved = used;
-      m.available = m.stock - used;
+      const d = drawnMap.get(r.id) || 0;
+      m.drawn = d;
+      m.reserved = (gross.get(r.id) || 0) - d;
+      m.available = m.stock - m.reserved;
       return m;
     });
 }
@@ -472,11 +590,11 @@ function getMaterial(id) {
   const row = getMaterialRow(id);
   if (!row) return null;
   const m = rowToMaterial(row);
-  const reserved = getDb()
-    .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
-    .get(id).n;
-  m.reserved = reserved;
-  m.available = m.stock - reserved;
+  const drawn = leadDrawnForMaterialMap().get(id) || 0;
+  const gross = leadGrossReservedFor(id);
+  m.drawn = drawn;
+  m.reserved = gross - drawn;
+  m.available = m.stock - m.reserved;
   return m;
 }
 
@@ -498,9 +616,7 @@ function updateMaterial(id, { name, stock }) {
   const txn = d.transaction(() => {
     const row = getMaterialRow(id);
     if (!row) return { code: 'not_found' };
-    const reserved = d
-      .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
-      .get(id).n;
+    const reserved = leadEffectiveReserved(id);
     if (stock !== undefined && stock < reserved) {
       return { code: 'stock_below_reserved', reserved };
     }
@@ -613,9 +729,7 @@ function confirmPlan(id) {
     if (mat.length_h !== row.material_length_h) {
       d.exec('ROLLBACK'); return { code: 'material_changed' };
     }
-    const reserved = d
-      .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
-      .get(row.material_id).n;
+    const reserved = leadEffectiveReserved(row.material_id);
     const available = mat.stock - reserved;
     if (row.required_bars > available) {
       d.exec('ROLLBACK');
@@ -642,6 +756,12 @@ function cancelPlan(id) {
   if (row.status === 'canceled') return { code: 'already_canceled' };
   d.exec('BEGIN IMMEDIATE');
   try {
+    // 已领过料的单据永久不能取消（已领出的实物无法回退到预留）
+    const drawn = leadDrawnForDoc('plan', id);
+    if (drawn > 0) {
+      d.exec('ROLLBACK');
+      return { code: 'drawn_blocked', drawnBars: drawn, requiredBars: row.required_bars };
+    }
     d.prepare(`UPDATE lead_plans
       SET status = 'canceled', canceled_at = datetime('now'), updated_at = datetime('now')
       WHERE id = ? AND status = 'confirmed'`).run(id);
@@ -678,8 +798,8 @@ function rowToGlassSheet(row, reserved = 0) {
   };
 }
 
-// 各颜色已被已确认订单预留的张数
-function glassReservedMap() {
+// 各颜色已被已确认订单预留的张数（毛预留，含已领出部分）
+function glassGrossReservedMap() {
   const rows = getDb()
     .prepare(`SELECT i.sheet_id AS id, COALESCE(SUM(i.required_sheets), 0) AS reserved
               FROM cut_order_items i
@@ -692,10 +812,26 @@ function glassReservedMap() {
   return m;
 }
 
+// 各颜色有效预留 = 毛预留 − 已领出
+function glassReservedMap() {
+  const gross = glassGrossReservedMap();
+  const drawn = glassDrawnForSheetMap();
+  const m = new Map();
+  for (const [id, g] of gross) m.set(id, g - (drawn.get(id) || 0));
+  return m;
+}
+
 function listGlassSheets() {
-  const reserved = glassReservedMap();
+  const gross = glassGrossReservedMap();
+  const drawn = glassDrawnForSheetMap();
   return getDb().prepare('SELECT * FROM glass_sheets ORDER BY color').all()
-    .map((r) => rowToGlassSheet(r, reserved.get(r.id) || 0));
+    .map((r) => {
+      const d = drawn.get(r.id) || 0;
+      const reserved = (gross.get(r.id) || 0) - d;
+      const s = rowToGlassSheet(r, reserved);
+      s.drawn = d;
+      return s;
+    });
 }
 
 // 以颜色键取规格（含库存视图）
@@ -713,14 +849,37 @@ function getGlassSheetByColorRow(color) {
   return getDb().prepare('SELECT * FROM glass_sheets WHERE color = ?').get(color);
 }
 
+function glassGrossReservedFor(sheetId) {
+  return getDb()
+    .prepare(`SELECT COALESCE(SUM(i.required_sheets),0) AS n
+              FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
+              WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(sheetId).n;
+}
+
+// 有效预留 = 毛预留 − 已领出
+function glassEffectiveReserved(sheetId, opts = {}) {
+  const gross = glassGrossReservedFor(sheetId);
+  if (opts.excludeOrderId) {
+    // 换单口径：把指定旧单自身视为即将释放（其毛预留与已领出都不再计入）
+    const ownReq = getDb()
+      .prepare(`SELECT COALESCE(SUM(i.required_sheets),0) AS n
+                FROM cut_order_items i WHERE i.order_id = ? AND i.sheet_id = ?`)
+      .get(opts.excludeOrderId, sheetId).n;
+    const ownDrawn = glassDrawnForOrderMap(opts.excludeOrderId).get(sheetId) || 0;
+    const otherDrawn = (glassDrawnForSheetMap().get(sheetId) || 0) - ownDrawn;
+    return (gross - ownReq) - otherDrawn;
+  }
+  return gross - (glassDrawnForSheetMap().get(sheetId) || 0);
+}
+
 function getGlassSheet(id) {
   const row = getGlassSheetRow(id);
   if (!row) return null;
-  const reserved = getDb()
-    .prepare(`SELECT COALESCE(SUM(i.required_sheets),0) AS n
-              FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
-              WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(id).n;
-  return rowToGlassSheet(row, reserved);
+  const drawn = glassDrawnForSheetMap().get(id) || 0;
+  const reserved = glassGrossReservedFor(id) - drawn;
+  const s = rowToGlassSheet(row, reserved);
+  s.drawn = drawn;
+  return s;
 }
 
 function createGlassSheet({ color, width, height, stock }) {
@@ -736,10 +895,7 @@ function updateGlassSheetStock(id, stock) {
   const txn = d.transaction(() => {
     const row = getGlassSheetRow(id);
     if (!row) return { code: 'not_found' };
-    const reserved = d
-      .prepare(`SELECT COALESCE(SUM(i.required_sheets),0) AS n
-                FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
-                WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(id).n;
+    const reserved = glassEffectiveReserved(id);
     if (stock < reserved) return { code: 'stock_below_reserved', reserved };
     d.prepare("UPDATE glass_sheets SET stock = ?, updated_at = datetime('now') WHERE id = ?").run(stock, id);
     return { code: 'ok', sheet: getGlassSheet(id) };
@@ -866,10 +1022,7 @@ function confirmCutOrder(id) {
         d.exec('ROLLBACK');
         return { code: 'sheet_changed', color: it.sheet_color };
       }
-      const reserved = d
-        .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
-                  FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
-                  WHERE ci.sheet_id = ? AND co.status = 'confirmed'`).get(it.sheet_id).n;
+      const reserved = glassEffectiveReserved(it.sheet_id);
       const available = sheet.stock - reserved;
       if (it.required_sheets > available) {
         shortages.push({
@@ -904,6 +1057,18 @@ function cancelCutOrder(id) {
   if (row.status === 'draft') return { code: 'draft_not_reserved' };
   if (row.status === 'canceled') return { code: 'already_canceled' };
   if (row.status === 'replaced') return { code: 'order_replaced' };
+  const drawnMap = glassDrawnForOrderMap(id);
+  const drawnTotal = [...drawnMap.values()].reduce((s, n) => s + n, 0);
+  if (drawnTotal > 0) {
+    return {
+      code: 'drawn_blocked',
+      drawnSheets: drawnTotal,
+      colors: [...drawnMap.entries()].map(([sheetId, sheets]) => {
+        const sr = getGlassSheetRow(sheetId);
+        return { color: sr ? sr.color : null, sheetId, sheets };
+      }),
+    };
+  }
   d.exec('BEGIN IMMEDIATE');
   try {
     d.prepare(`UPDATE cut_orders
@@ -983,7 +1148,22 @@ function replaceCutOrder(oldId, o) {
     if (oldRow.status === 'draft') { d.exec('ROLLBACK'); return { code: 'order_not_confirmed' }; }
     if (oldRow.status !== 'confirmed') { d.exec('ROLLBACK'); return { code: 'order_replaced' }; }
 
-    // 逐色核对：把旧单视为即将释放，故可用量 = stock − 其他已确认单预留 + 旧单自身预留
+    // 已领过料的独立裁片订单不能换单（已领出的实物不能退回到预留池）
+    const oldDrawnMap = glassDrawnForOrderMap(oldId);
+    const oldDrawnTotal = [...oldDrawnMap.values()].reduce((s, n) => s + n, 0);
+    if (oldDrawnTotal > 0) {
+      d.exec('ROLLBACK');
+      return {
+        code: 'drawn_blocked',
+        drawnSheets: oldDrawnTotal,
+        colors: [...oldDrawnMap.entries()].map(([sheetId, sheets]) => {
+          const sr = getGlassSheetRow(sheetId);
+          return { color: sr ? sr.color : null, sheetId, sheets };
+        }),
+      };
+    }
+
+    // 逐色核对：把旧单视为即将释放，故可用量 = stock − 其他已确认单有效预留（旧单未领料，其毛预留全额释放）
     const shortages = [];
     for (const it of o.items) {
       const sheet = getGlassSheetRow(it.sheetId);
@@ -995,11 +1175,7 @@ function replaceCutOrder(oldId, o) {
         d.exec('ROLLBACK');
         return { code: 'sheet_changed', color: it.color };
       }
-      const reservedOther = d
-        .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
-                  FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
-                  WHERE ci.sheet_id = ? AND co.status = 'confirmed' AND co.id <> ?`)
-        .get(it.sheetId, oldId).n;
+      const reservedOther = glassEffectiveReserved(it.sheetId, { excludeOrderId: oldId });
       const availableAfterRelease = sheet.stock - reservedOther;
       if (it.requiredSheets > availableAfterRelease) {
         shortages.push({
@@ -1135,9 +1311,7 @@ function createComboOrder(c) {
     const mat = getMaterialRow(c.materialId);
     if (!mat) { d.exec('ROLLBACK'); return { code: 'material_missing' }; }
     if (mat.length_h !== c.materialLengthH) { d.exec('ROLLBACK'); return { code: 'material_changed' }; }
-    const leadReserved = d
-      .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
-      .get(c.materialId).n;
+    const leadReserved = leadEffectiveReserved(c.materialId);
     const leadAvailable = mat.stock - leadReserved;
     if (c.requiredBars > leadAvailable) {
       d.exec('ROLLBACK');
@@ -1156,10 +1330,7 @@ function createComboOrder(c) {
       if (sheet.width_mm !== it.width || sheet.height_mm !== it.height) {
         d.exec('ROLLBACK'); return { code: 'sheet_changed', color: it.color };
       }
-      const reserved = d
-        .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
-                  FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
-                  WHERE ci.sheet_id = ? AND co.status = 'confirmed'`).get(it.sheetId).n;
+      const reserved = glassEffectiveReserved(it.sheetId);
       const available = sheet.stock - reserved;
       if (it.requiredSheets > available) {
         glassShortages.push({
@@ -1235,6 +1406,23 @@ function cancelComboOrder(id) {
     const cur = d.prepare('SELECT * FROM combo_orders WHERE id = ?').get(id);
     if (cur.status === 'canceled') { d.exec('ROLLBACK'); return { code: 'already_canceled' }; }
 
+    // 整套单只要任一类已领过料，就永久不能取消（已领出的实物无法回退到预留）
+    const leadDrawn = leadDrawnForDoc('combo', id);
+    const glassDrawnMap = glassDrawnForOrderMap(cur.cut_order_id);
+    const glassDrawn = [...glassDrawnMap.values()].reduce((s, n) => s + n, 0);
+    if (leadDrawn > 0 || glassDrawn > 0) {
+      d.exec('ROLLBACK');
+      return {
+        code: 'drawn_blocked',
+        drawnBars: leadDrawn,
+        drawnSheets: glassDrawn,
+        colors: [...glassDrawnMap.entries()].map(([sheetId, sheets]) => {
+          const sr = getGlassSheetRow(sheetId);
+          return { color: sr ? sr.color : null, sheetId, sheets };
+        }),
+      };
+    }
+
     const pn = d.prepare(`UPDATE lead_plans
       SET status = 'canceled', canceled_at = datetime('now'), updated_at = datetime('now')
       WHERE id = ? AND combo_id = ? AND status = 'confirmed'`).run(cur.lead_plan_id, id);
@@ -1287,18 +1475,13 @@ function listStocktakeItemRows(stocktakeId) {
     .all(stocktakeId);
 }
 
-// 单规格当前已被已确认计划/订单预留的数量（独立单与整套单关联单同一口径，按状态计）。
+// 单规格当前有效预留（毛预留 − 已领出；独立单与整套关联单同一口径，按状态计）。
 function leadReservedFor(materialId) {
-  return getDb()
-    .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
-    .get(materialId).n;
+  return leadEffectiveReserved(materialId);
 }
 
 function glassReservedFor(sheetId) {
-  return getDb()
-    .prepare(`SELECT COALESCE(SUM(i.required_sheets),0) AS n
-              FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
-              WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(sheetId).n;
+  return glassEffectiveReserved(sheetId);
 }
 
 // 生成某一项的预览基准（系统库存、已确认预留、规格身份快照）。
@@ -1508,6 +1691,195 @@ function deleteStocktake(id) {
   return { code: 'ok' };
 }
 
+// ---------- 领料出库（按已确认计划/订单/整套单分次领料；同事务扣实物库存与预留） ----------
+
+function getRequisitionRow(id) {
+  return getDb().prepare('SELECT * FROM requisitions WHERE id = ?').get(id);
+}
+
+function getRequisitionByCode(code) {
+  return getDb().prepare('SELECT * FROM requisitions WHERE code = ?').get(code) || null;
+}
+
+function listRequisitionItemRows(requisitionId) {
+  return getDb()
+    .prepare('SELECT * FROM requisition_glass_items WHERE requisition_id = ? ORDER BY id')
+    .all(requisitionId);
+}
+
+function listRequisitionRows(filter = {}) {
+  const { docType, docId } = filter;
+  if (docType) {
+    return getDb()
+      .prepare('SELECT * FROM requisitions WHERE doc_type = ? AND doc_id = ? ORDER BY id')
+      .all(docType, docId);
+  }
+  return getDb().prepare('SELECT * FROM requisitions ORDER BY id DESC').all();
+}
+
+// 把服务端规范化后的领料内容转成可比较/存储的形状（玻璃按 sheetId 升序）。
+function canonContent({ docType, leadBars = 0, glass = [] }) {
+  const g = glass
+    .filter((x) => x.sheets > 0)
+    .map((x) => ({ sheetId: x.sheetId, color: x.color, sheets: x.sheets }))
+    .sort((a, b) => a.sheetId - b.sheetId);
+  return { docType, leadBars, glass: g };
+}
+
+// 判断一次重试内容是否与原记录一致（玻璃按 sheetId+sheets 比较）
+function requisitionContentEqual(row, itemRows, canon) {
+  if (row.doc_type !== canon.docType || row.lead_bars !== canon.leadBars) return false;
+  if (itemRows.length !== canon.glass.length) return false;
+  const oldItems = itemRows
+    .filter((it) => it.sheets > 0)
+    .sort((a, b) => a.sheet_id - b.sheet_id);
+  if (oldItems.length !== canon.glass.length) return false;
+  return oldItems.every((it, i) => it.sheet_id === canon.glass[i].sheetId && it.sheets === canon.glass[i].sheets);
+}
+
+// 确认领料：一个 BEGIN IMMEDIATE 事务内
+//   1) 领料号已存在：同内容幂等返回原记录（idempotent），不同内容返回 code_conflict；
+//   2) 单据必须为已确认、且类型相符（独立计划/订单不能带 combo_id；整套单须存在）；
+//   3) 数量为非负整数且至少一项 > 0；裁片/整套玻璃色必须属于该单，且不得超过该单剩余预留；
+//   4) 实物库存必须足够（双保险：有效预留恒 ≤ 实物库存）；
+//   5) 同事务扣减实物库存（lead_materials/glass_sheets.stock）并写入不可变领料记录。
+// 参数 q: { code, docType:'plan'|'order'|'combo', docId, leadBars, glass:[{sheetId,color,sheets}] }
+function createRequisition(q) {
+  const d = getDb();
+  const canon = canonContent(q);
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    // ---- 幂等 / 冲突（全局唯一领料号）----
+    const dup = d.prepare('SELECT * FROM requisitions WHERE code = ?').get(q.code);
+    if (dup) {
+      d.exec('ROLLBACK');
+      const dupItems = listRequisitionItemRows(dup.id);
+      if (dup.doc_id === q.docId && requisitionContentEqual(dup, dupItems, canon)) {
+        return { code: 'idempotent', row: dup, itemRows: dupItems };
+      }
+      return {
+        code: 'code_conflict',
+        requisitionId: dup.id,
+        current: {
+          docType: dup.doc_type, docId: dup.doc_id,
+          leadBars: dup.lead_bars,
+          glass: dupItems.filter((it) => it.sheets > 0)
+            .sort((a, b) => a.sheet_id - b.sheet_id)
+            .map((it) => ({ sheetId: it.sheet_id, color: it.sheet_color, sheets: it.sheets })),
+        },
+      };
+    }
+
+    // ---- 单据定位与状态/类型校验 ----
+    let materialId = null;
+    let planRow = null;
+    let orderId = null;
+    if (q.docType === 'plan') {
+      planRow = d.prepare('SELECT * FROM lead_plans WHERE id = ?').get(q.docId);
+      if (!planRow) { d.exec('ROLLBACK'); return { code: 'doc_not_found' }; }
+      if (planRow.combo_id) { d.exec('ROLLBACK'); return { code: 'combo_locked', comboId: planRow.combo_id }; }
+      if (planRow.status !== 'confirmed') { d.exec('ROLLBACK'); return { code: 'doc_not_confirmed', status: planRow.status }; }
+      materialId = planRow.material_id;
+    } else if (q.docType === 'order') {
+      const orderRow = d.prepare('SELECT * FROM cut_orders WHERE id = ?').get(q.docId);
+      if (!orderRow) { d.exec('ROLLBACK'); return { code: 'doc_not_found' }; }
+      if (orderRow.combo_id) { d.exec('ROLLBACK'); return { code: 'combo_locked', comboId: orderRow.combo_id }; }
+      if (orderRow.status !== 'confirmed') { d.exec('ROLLBACK'); return { code: 'doc_not_confirmed', status: orderRow.status }; }
+      orderId = orderRow.id;
+    } else if (q.docType === 'combo') {
+      const comboRow = d.prepare('SELECT * FROM combo_orders WHERE id = ?').get(q.docId);
+      if (!comboRow) { d.exec('ROLLBACK'); return { code: 'doc_not_found' }; }
+      if (comboRow.status !== 'confirmed') { d.exec('ROLLBACK'); return { code: 'doc_not_confirmed', status: comboRow.status }; }
+      materialId = comboRow.material_id;
+      orderId = comboRow.cut_order_id;
+      planRow = d.prepare('SELECT * FROM lead_plans WHERE id = ?').get(comboRow.lead_plan_id);
+    } else {
+      d.exec('ROLLBACK');
+      return { code: 'invalid_type' };
+    }
+
+    // ---- 数量语义校验 ----
+    const glassTotal = canon.glass.reduce((s, x) => s + x.sheets, 0);
+    const leadBars = canon.leadBars || 0;
+    if (leadBars < 0 || glassTotal < 0) { d.exec('ROLLBACK'); return { code: 'invalid_quantity' }; }
+    if (leadBars === 0 && glassTotal === 0) { d.exec('ROLLBACK'); return { code: 'empty_requisition' }; }
+    if (q.docType === 'plan' && glassTotal > 0) { d.exec('ROLLBACK'); return { code: 'glass_not_applicable' }; }
+    if (q.docType === 'order' && leadBars > 0) { d.exec('ROLLBACK'); return { code: 'lead_not_applicable' }; }
+
+    // ---- 铅条剩余预留 + 实物库存 ----
+    if (leadBars > 0) {
+      const docTypeForDrawn = q.docType === 'plan' ? 'plan' : 'combo';
+      const requiredBars = planRow.required_bars;
+      const alreadyDrawn = leadDrawnForDoc(docTypeForDrawn, q.docId);
+      const remaining = requiredBars - alreadyDrawn;
+      if (leadBars > remaining) {
+        d.exec('ROLLBACK');
+        return { code: 'exceeds_remaining', kind: 'lead', required: requiredBars, drawn: alreadyDrawn, remaining, requested: leadBars };
+      }
+      const mat = getMaterialRow(materialId);
+      if (!mat) { d.exec('ROLLBACK'); return { code: 'material_missing' }; }
+      if (mat.stock < leadBars) {
+        d.exec('ROLLBACK');
+        return { code: 'physical_shortage', kind: 'lead', stock: mat.stock, requested: leadBars };
+      }
+    }
+
+    // ---- 玻璃逐色剩余预留 + 实物库存 ----
+    const shortages = [];
+    const physicalShortages = [];
+    const orderItems = d.prepare('SELECT * FROM cut_order_items WHERE order_id = ?').all(orderId);
+    const requiredBySheet = new Map(orderItems.map((it) => [it.sheet_id, it]));
+    const drawnBySheet = glassDrawnForOrderMap(orderId);
+    for (const g of canon.glass) {
+      const it = requiredBySheet.get(g.sheetId);
+      if (!it) {
+        d.exec('ROLLBACK');
+        return { code: 'color_not_in_order', sheetId: g.sheetId, color: g.color };
+      }
+      const required = it.required_sheets;
+      const drawn = drawnBySheet.get(g.sheetId) || 0;
+      const remaining = required - drawn;
+      if (g.sheets > remaining) {
+        shortages.push({
+          color: it.sheet_color, sheetId: g.sheetId,
+          required, drawn, remaining, requested: g.sheets,
+        });
+      }
+      const sheet = getGlassSheetRow(g.sheetId);
+      if (!sheet) { d.exec('ROLLBACK'); return { code: 'sheet_missing', color: g.color }; }
+      if (sheet.stock < g.sheets) {
+        physicalShortages.push({ color: sheet.color, sheetId: g.sheetId, stock: sheet.stock, requested: g.sheets });
+      }
+    }
+    if (shortages.length) { d.exec('ROLLBACK'); return { code: 'exceeds_remaining', kind: 'glass', shortages }; }
+    if (physicalShortages.length) { d.exec('ROLLBACK'); return { code: 'physical_shortage', kind: 'glass', shortages: physicalShortages }; }
+
+    // ---- 扣减实物库存 ----
+    if (leadBars > 0) {
+      d.prepare('UPDATE lead_materials SET stock = stock - ?, updated_at = datetime(\'now\') WHERE id = ?')
+        .run(leadBars, materialId);
+    }
+    for (const g of canon.glass) {
+      d.prepare('UPDATE glass_sheets SET stock = stock - ?, updated_at = datetime(\'now\') WHERE id = ?')
+        .run(g.sheets, g.sheetId);
+    }
+
+    // ---- 写不可变领料记录 ----
+    const info = d.prepare(`INSERT INTO requisitions (code, doc_type, doc_id, lead_bars, glass_sheets)
+      VALUES (?, ?, ?, ?, ?)`).run(q.code, q.docType, q.docId, leadBars, glassTotal);
+    const reqId = info.lastInsertRowid;
+    const insItem = d.prepare(`INSERT INTO requisition_glass_items
+      (requisition_id, sheet_id, sheet_color, sheets) VALUES (?, ?, ?, ?)`);
+    for (const g of canon.glass) insItem.run(reqId, g.sheetId, g.color, g.sheets);
+
+    d.exec('COMMIT');
+    return { code: 'ok', row: getRequisitionRow(reqId), itemRows: listRequisitionItemRows(reqId) };
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
+}
+
 module.exports = {
   init, getDb,
   createDesign, getDesign, listDesigns,
@@ -1524,4 +1896,10 @@ module.exports = {
   createStocktake, updateStocktakeDraft, confirmStocktake, deleteStocktake,
   getStocktake, getStocktakeRow, listStocktakes, listStocktakeItemRows,
   leadReservedFor, glassReservedFor,
+  // 领料出库
+  createRequisition, getRequisitionRow, getRequisitionByCode, listRequisitionRows,
+  listRequisitionItemRows, leadDrawnForDoc, leadDrawnForMaterialMap,
+  glassDrawnForOrderMap, glassDrawnForSheetMap,
+  leadGrossReservedFor, glassGrossReservedFor,
+  leadEffectiveReserved, glassEffectiveReserved,
 };

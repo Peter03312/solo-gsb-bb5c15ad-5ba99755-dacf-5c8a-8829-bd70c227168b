@@ -18,6 +18,7 @@
       <button id="tabCutting" class="tab">玻璃裁片</button>
       <button id="tabCombo" class="tab">整套备料</button>
       <button id="tabStocktake" class="tab">库存盘点</button>
+      <button id="tabRequisition" class="tab">领料出库</button>
     </nav>
   </header>
 
@@ -412,6 +413,47 @@
       <div class="lead-panel">
         <h2>盘点预览 / 盘点单详情</h2>
         <div id="stDetail" class="hint">在左侧勾选规格并录入实盘数，点击“预览盘点”。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ 领料出库视图 ============ -->
+  <main id="viewRequisition" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>① 选择已确认单据分次领料</h2>
+        <label>单据类型
+          <select id="rqDocType">
+            <option value="plan">独立铅条计划</option>
+            <option value="order">独立裁片订单</option>
+            <option value="combo">整套用料单</option>
+          </select>
+        </label>
+        <label>领料单据
+          <select id="rqDocSelect"></select>
+        </label>
+        <div id="rqForm"></div>
+        <div id="rqMsg" class="hint">仅已确认的独立铅条计划、独立裁片订单或整套用料单可分次领料；数量为非负整数且至少一项大于零，不能超过该单对应剩余预留。整套单允许只领其中一类。</div>
+      </section>
+
+      <section>
+        <h2>② 领料历史</h2>
+        <div class="form-row">
+          <label>按领料号查询<input id="rqSearchCode" type="text" placeholder="输入唯一领料号" maxlength="80"></label>
+        </div>
+        <div class="btn-row">
+          <button id="btnRqSearch">查领料号</button>
+          <button id="btnRqAll">全部记录</button>
+        </div>
+        <div id="rqHistoryList"></div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="rqBanner" class="banner" hidden></div>
+      <div class="lead-panel">
+        <h2>单据剩余预留 / 领料结果</h2>
+        <div id="rqDetail" class="hint">在左侧选择单据类型与已确认单据，页面会展示各规格尚未领出的预留量；提交唯一领料号与本次根数/各色张数。</div>
       </div>
     </section>
   </main>

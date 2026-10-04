@@ -16,6 +16,8 @@
 
 月底或盘点时还可在**同一张盘点单**中勾选若干**铅条原材与玻璃原片**规格，逐项录入**实盘总数**（非负整数，同单规格不得重复）：预览保存各项当时的**系统库存、已确认独立单与整套单预留、差异及实盘后可用量，但不改库存**；确认时在**同一事务**内重核所有选中规格的库存与预留——**任一项与预览基准不符或实盘数低于当前预留，即返回该项及原因、整单不生效**；全部通过才一次更新库存，并记下**原值、实盘值与确认时间**。已确认盘点**重复提交返回同一记录、不再调整**，记录永久保留可在网页查阅；独立计划、裁片订单与整套单的确认/取消随后继续按盘点后库存计算，原有库存调整入口也继续可用。
 
+最后，工作室按已确认的**独立铅条计划、独立裁片订单或整套用料单分次领料出库**：网页展示各规格**尚未领出的预留量（余留）**；操作者提交**单据、唯一领料号及本次铅条根数或各色原片张数**（非负整数、至少一项大于零、不得超过该单对应剩余预留，整套单允许只领其中一类）。确认时在**同一事务**内**扣减实物库存与对应预留**，留下**不可变领料记录**，返回**本次、累计领料及余留量**；任一项不合法则**整次不生效**。同一领料号与相同内容重试**返回原记录**，内容不同报**冲突**。**已领料单据不能取消，独立裁片订单也不能换单**；未领料单据仍按原规则操作。盘点、手工库存调整与后续确认都按**结转后的库存与预留**计算。网页可查**领料历史**，并提供可调用的 HTTP API 与调用示例。
+
 ## 功能一览
 
 - **窗框建模**：宽、高为正整数毫米（1–100000）。
@@ -81,6 +83,15 @@
   - **确认整单重核（同事务）**：在一个 `BEGIN IMMEDIATE` 事务内对所有项重核——规格仍存在、规格身份未变（铅条定尺/玻璃宽高）、**系统库存与预留均与预览基准一致**、且**实盘数不低于当前已确认预留**；任一项不符即 **409 返回全部问题项及原因**（`spec_missing`/`spec_changed`/`stock_changed`/`reserved_changed`/`below_reserved`，附基准值与当前值），**整单不生效、库存不变**。
   - **一次更新与永久记录**：全部通过才在同一事务内一次更新各规格库存，并记录每项**原值、实盘值与确认时间**；已确认单**重复提交返回同一记录**（`idempotent:true`），**不再调整库存**；已确认单不可修改/删除，列表与详情（含网页）随时可查。
   - **盘点后口径不变**：独立铅条计划、独立裁片订单（含换单）与整套用料单的确认/取消继续按 `库存 − 已确认预留` 计算（已包含盘点调整后的库存）；`PATCH` 调整库存的原入口继续可用，但预览后经该入口变动库存会使旧预览在确认时按基准不符被拒绝。
+- **领料出库（本轮新增）**：
+  - **分次领料对象**：仅**已确认**的**独立铅条计划**（领铅条根数）、**独立裁片订单**（领各色原片张数）或**整套用料单**（可同时领两类，也**允许只领其中一类**）；草稿/已取消/已替换单据与整套关联单的独立入口一律拒绝（关联单须按整套单领）。
+  - **余留可见**：计划/订单/整套详情与库存视图展示每规格 `需求 / 累计已领 / 尚未领出（余留）`；`GET .../requisitions/remaining` 返回提交前的剩余预留。
+  - **提交校验**：携带全局唯一**领料号 `code`** 与本次 `leadBars`（根）和/或 `glass:[{color 或 sheetId, sheets}]`（各色张）；数量为**非负整数且至少一项大于零**，每个数量**不得超过该单对应剩余预留**（裁片/整套的颜色必须属于该单）；任一不合法 **400/409 整次不生效**，库存与预留不变。
+  - **同事务扣减**：确认在一个 `BEGIN IMMEDIATE` 事务内**同时扣减实物库存与对应预留**（二者各减一次，因此可用量不变），写入**不可变领料记录**；返回**本次 `thisTime`、累计 `cumulative` 与余留 `remaining`**。
+  - **幂等与冲突**：同一领料号 + 完全相同的单据与内容重试 → **200 返回原记录**（`idempotent:true`，不重复扣减）；同号但单据或数量不同 → **409 `code_conflict`**（附原记录内容）；并发由写事务串行化，不会重复扣库存。
+  - **终态锁定**：**已领料**的计划/订单/整套单**不能取消**（409 `drawn_blocked`）；**已领料的独立裁片订单不能换单**（预览与确认均 409）。未领料单据的取消、换单、删除等仍完全按原规则操作。
+  - **结转口径**：`/api/materials`、`/api/glass-sheets` 的 `reserved/available` 自动按 `毛预留 − 已领出` 计算并新增 `drawn`；盘点预览/确认与手工 `PATCH` 库存的下限都按**结转后的有效预留**计算。
+  - **历史**：`GET /api/requisitions`（可按 `code` 或 `docType+docId` 过滤）、单据维度 `GET .../requisitions` 与单条 `GET /api/requisitions/:id`；网页新增“领料出库”标签可选择单据领料、按号查询并浏览全部领料记录，计划/订单/整套详情内也有“分次领料”入口。
 
 ## 技术栈
 
@@ -201,6 +212,13 @@ Compose 中通过命名卷 `studio-data` 持久化 `/data`；改宿主机端口�
 | PUT | `/api/stocktakes/:id` | 修改草稿盘点单（重选规格/改实盘数并重新固化基准；已确认 409） |
 | POST | `/api/stocktakes/:id/confirm` | 确认盘点（同事务重核全部项；不符返回 409 各项原因；重复提交幂等返回原记录） |
 | DELETE | `/api/stocktakes/:id` | 删除草稿盘点单（已确认永久记录不可删，409） |
+| POST | `/api/plans/:id/requisitions` | 独立铅条计划领料 `{code,leadBars}`（同事务扣库存与预留；同号幂等/冲突） |
+| POST | `/api/cut-orders/:id/requisitions` | 独立裁片订单领料 `{code,glass:[{color\|sheetId,sheets}]}` |
+| POST | `/api/combo-orders/:id/requisitions` | 整套单领料 `{code,leadBars?,glass?}`（可只领一类，至少一项 >0） |
+| GET | `/api/plans/:id/requisitions/remaining` 等 | 单据各规格尚未领出的预留量（plan/cut-orders/combo-orders 各一） |
+| GET | `/api/plans/:id/requisitions` 等 | 某单据的领料历史（plan/cut-orders/combo-orders 各一） |
+| GET | `/api/requisitions` | 全库领料历史（可 `?code=` 或 `?docType=&docId=` 过滤） |
+| GET | `/api/requisitions/:id` | 单条不可变领料记录 |
 
 校验失败统一返回：
 
@@ -223,6 +241,7 @@ Compose 中通过命名卷 `studio-data` 持久化 `/data`；改宿主机端口�
 10. 切到“玻璃裁片”标签：按颜色登记原片宽×高（1–2000 整数 mm）与库存张数 → 选发布版本、制作件数与片间最小间距 → “排样预览”查看逐张原片的片号/件次/旋转/坐标/轮廓与各色用板、库存缺口 → “存为草稿订单” → 库存充足时“确认订单”原子预留所有颜色；需要退料时“取消订单”一次性释放。客户改图并再次发布后，打开**已确认订单**详情、展开底部“⇄ 换单”面板 → 选同一图纸的新版本、件数与片间距 → “换单预览”核对各色旧/新用板、净增减与旧单释放后的可用量 → “确认换单”原子完成（旧单变“已替换”，新单即确认）；相同参数重复提交会返回原新单。
 11. 切到“整套备料”标签：选发布版本、件数、铅条原材与刀损、玻璃片距 → “整套预览”一次看清铅条根数与各色原片张数的可用/缺口（不占库存）→ “确认整套单”在同一事务预留两类库存并生成绑定同一快照与件数的关联生产计划、裁片订单；退料时在整套单详情“取消整套单”，两类预留各释放一次。关联单在“铅条生产/玻璃裁片”中带 🔗 标记，只能查阅、不能单独操作。
 12. 切到“库存盘点”标签：勾选要盘点的铅条原材与玻璃原片规格（可只盘其中几项）、逐项填写实盘总数 → “预览盘点”保存当时的系统库存、已确认预留、差异与实盘后可用量（不改库存）→ 核对无误后“确认盘点”；若预览后库存或预留有变化，或某项实盘数低于当前预留，会标出该项与原因且整单不生效，可“改后重新预览”刷新基准后再确认。已确认盘点单永久保留、重复确认返回原记录；之后独立计划、裁片订单与整套单都按盘点后的库存继续计算。
+13. 生产领料时切到“**领料出库**”标签：选择单据类型（独立铅条计划/独立裁片订单/整套用料单）与已确认单据，页面显示各规格“需求 / 累计已领 / 尚未领出（余留）”→ 填写**唯一领料号**与本次铅条根数或各色原片张数（整套可只领一类）→ “提交领料”，在同一事务扣减实物库存与对应预留，并显示本次、累计与余留；同号同内容重试返回原记录、内容不同报冲突。已领料的计划/订单/整套不能取消，已领料的裁片订单也不能换单；下方可按领料号或浏览全部领料历史。也可在计划/订单/整套详情点“分次领料”直接进入。
 
 ## 玻璃裁片排样规则
 
@@ -565,6 +584,93 @@ curl -s localhost:3000/api/stocktakes/1
 # -> 409 {"ok":false,"code":"already_confirmed",...} / 409 已确认盘点单为永久记录，不能删除
 ```
 
+## 领料出库规则（计划 / 裁片订单 / 整套单 分次领料）
+
+- **可领料对象（仅已确认）**：
+  - 独立铅条计划 `POST /api/plans/:id/requisitions`（不能是整套关联计划）；
+  - 独立裁片订单 `POST /api/cut-orders/:id/requisitions`（不能是整套关联订单、不能已替换）；
+  - 整套用料单 `POST /api/combo-orders/:id/requisitions`（铅条、玻璃可同时领，也**允许只领其中一类**）。
+  - 草稿、已取消、已替换单据 → 409 `doc_not_confirmed`；单据不存在 → 404；关联单从独立入口提交 → 409 `combo_locked`。
+- **入参**：
+  - `code`：**全局唯一领料号**，1–80 个字母/数字/中文/`._:-`，必填，作为客户端幂等键；
+  - 铅条计划：`leadBars`（非负整数根）；
+  - 裁片订单：`glass:[{color:"#rrggbb" 或 sheetId, sheets}]`，各项 `sheets` 为非负整数，颜色大小写自动归一，**必须属于该单**（否则 400 `color_not_in_order`）；
+  - 整套单：`leadBars` 与/或 `glass` 均可（只领一类时另一项省略或为 0）。
+  - 所有数量为非负整数，且**至少一项大于 0**（否则 400）；每个数量不得超过该单对应**剩余预留 = 需求 − 该单累计已领**（否则 409 `exceeds_remaining`，返回需求/已领/余留/本次及逐色明细，整次不生效）。
+- **原子确认（同一事务）**：在一个 `BEGIN IMMEDIATE` 事务内**逐规格扣减实物库存**（`lead_materials.stock` / `glass_sheets.stock`），并因毛预留不变、已领增加而使**有效预留同步减少相同数量**（`reserved = 毛预留 − 已领出`，故 `available = stock − reserved` 不变）；同事务写入领料主记录与玻璃分色明细。实物库存不足（理论上被“不得超过余留”阻止，双保险）→ 409 `physical_shortage`，整次回滚。
+- **返回**：`thisTime`（本次根数/各色张数）、`cumulative`（累计铅条 `leadBars` 与 `cumulativeGlass` 各色累计）、`remaining`（铅条 `lead:{requiredBars,drawnBars,remainingBars}`、玻璃 `glass:{totalRequired,totalDrawn,totalRemaining,colors[]:{requiredSheets,drawnSheets,remainingSheets}}`）以及不可变 `requisition` 记录。
+- **幂等与冲突**：相同 `code` 且**单据与数量内容完全一致**重试 → HTTP 200、`idempotent:true`、返回原记录（不再次扣减）；相同 `code` 但**单据不同或任一数量不同** → 409 `code_conflict`（附原记录 `current`）。
+- **终态锁定（已领料不可逆）**：
+  - 已领料的独立计划 / 整套单取消 → 409 `drawn_blocked`；
+  - 已领料的独立裁片订单取消、换单预览、换单确认 → 409 `drawn_blocked`；
+  - **未领料**的单据一切照旧：计划可取消/删除、订单可取消/换单、整套可取消（各释放一次）。
+- **结转后的库存与预留口径**：`GET /api/materials`、`/api/glass-sheets` 新增 `drawn`（累计已领出），`reserved` 改为**有效预留**（毛预留 − 已领出），`available = stock − reserved`；手工 `PATCH` 库存的下限与盘点预览/确认中的预留均使用该有效预留（因此盘点实盘只需 ≥ 尚未领出的余留，已领出部分已从实物库存中扣除）。
+- **历史查询（只读）**：
+  - `GET /api/requisitions`：全库领料记录（倒序），支持 `?code=<领料号>` 精确查询、`?docType=plan|order|combo&docId=<id>` 按单据过滤；
+  - `GET /api/plans|cut-orders|combo-orders/:id/requisitions`：该单据的领料记录（正序）；
+  - `GET /api/requisitions/:id`：单条不可变记录（含铅条/玻璃明细 `lines` 与单据引用 `docRef`）。
+
+### 领料出库调用示例（curl）
+
+```bash
+# 0) 前置：已确认一张独立铅条计划 #5（需 2 根）、一张独立裁片订单 #7（红/绿各 1 张）、
+#    一张整套单 #1（铅条 1 根 + 红/绿各 1 张）；铅条库存 10、红/绿各 5。
+
+# 1) 查看单据尚未领出的预留量（提交前展示）
+curl -s localhost:3000/api/plans/5/requisitions/remaining
+# -> {"ok":true,"docType":"plan","docId":5,
+#     "remaining":{"lead":{"materialId":1,"requiredBars":2,"drawnBars":0,"remainingBars":2},
+#                  "glass":{"totalRequired":0,...}}}
+
+# 2) 独立铅条计划第一次领 1 根
+curl -s -X POST localhost:3000/api/plans/5/requisitions \
+  -H 'Content-Type: application/json' -d '{"code":"LL-20261004-01","leadBars":1}'
+# -> 201 {"ok":true,"idempotent":false,
+#     "requisition":{"id":1,"code":"LL-20261004-01","docType":"plan","docId":5,"leadBars":1,...},
+#     "thisTime":{"leadBars":1,"glass":[],"glassSheets":0},
+#     "cumulative":{"leadBars":1},
+#     "remaining":{"lead":{"requiredBars":2,"drawnBars":1,"remainingBars":1}, ...}}
+# 实物库存与有效预留各减 1：GET /api/materials/1 -> stock 9, reserved 1, drawn 1, available 8
+
+# 3) 同一领料号 + 相同内容重试 → 返回原记录（200, idempotent:true，不重复扣减）
+curl -s -X POST localhost:3000/api/plans/5/requisitions \
+  -H 'Content-Type: application/json' -d '{"code":"LL-20261004-01","leadBars":1}'
+
+# 4) 同一领料号但数量不同 → 409 冲突（不生效）
+# -> 409 {"ok":false,"code":"code_conflict","requisitionId":1,
+#         "current":{"docType":"plan","docId":5,"leadBars":1,"glass":[]}}
+
+# 5) 独立裁片订单：一次领红色 1 张（颜色可用 #RRGGBB 或 sheetId）
+curl -s -X POST localhost:3000/api/cut-orders/7/requisitions -H 'Content-Type: application/json' \
+  -d '{"code":"CO-20261004-01","glass":[{"color":"#FF0000","sheets":1}]}'
+# 也可多色一次领：{"code":"...","glass":[{"sheetId":1,"sheets":1},{"color":"#00ff00","sheets":1}]}
+# 返回 remaining.glass.colors 逐色 requiredSheets/drawnSheets/remainingSheets
+
+# 6) 整套单：允许只领一类（先只领铅条），随后再领玻璃
+curl -s -X POST localhost:3000/api/combo-orders/1/requisitions -H 'Content-Type: application/json' \
+  -d '{"code":"CB-20261004-01","leadBars":1}'
+curl -s -X POST localhost:3000/api/combo-orders/1/requisitions -H 'Content-Type: application/json' \
+  -d '{"code":"CB-20261004-02","glass":[{"color":"#00ff00","sheets":1}]}'
+
+# 7) 超过该单剩余预留（红色已领完再领 1）→ 409，整次不生效
+# -> 409 {"ok":false,"code":"exceeds_remaining",
+#         "shortages":[{"color":"#ff0000","required":1,"drawn":1,"remaining":0,"requested":1}]}
+
+# 8) 已领料单据不能取消 / 独立裁片订单不能换单
+curl -s -X POST localhost:3000/api/plans/5/cancel
+# -> 409 {"ok":false,"code":"drawn_blocked","error":"该计划已领出 1 根铅条，已领料单据不能取消",...}
+curl -s -X POST localhost:3000/api/cut-orders/7/replacement/preview \
+  -H 'Content-Type: application/json' -d '{"targetVersion":2}'
+# -> 409 {"ok":false,"code":"drawn_blocked","error":"该订单已领出 1 张原片，已领料单据不能换单"}
+
+# 9) 领料历史：全库 / 按领料号 / 按单据 / 单条
+curl -s localhost:3000/api/requisitions
+curl -s 'localhost:3000/api/requisitions?code=LL-20261004-01'
+curl -s 'localhost:3000/api/requisitions?docType=combo&docId=1'
+curl -s localhost:3000/api/cut-orders/7/requisitions
+curl -s localhost:3000/api/requisitions/1
+```
+
 ## 铅条生产排产规则
 
 - **长度单位**：所有长度（定尺、切段、刀损、余料）内部都以 **0.01 mm 的整数倍**精确运算，接口接受至多两位小数的毫米数；超过精度（如 `6000.005`）直接拒绝。
@@ -720,15 +826,15 @@ curl -s localhost:3000/api/materials
 Dockerfile               容器镜像（含 better-sqlite3 编译环境）
 docker-compose.yml       一键启动 + 数据卷持久化
 src/
-  server.js              Express 入口与 API（图纸/发布/两版核对/原材/生产计划/玻璃裁片/裁片换单/整套用料单/库存盘点）
-  db.js                  SQLite 初始化与数据访问（铅条与玻璃原片原子预留、裁片换单与整套单原子事务、盘点基准重核与一次更新；旧库自动迁移）
+  server.js              Express 入口与 API（图纸/发布/两版核对/原材/生产计划/玻璃裁片/裁片换单/整套用料单/库存盘点/领料出库）
+  db.js                  SQLite 初始化与数据访问（铅条与玻璃原片原子预留、裁片换单与整套单原子事务、盘点基准重核与一次更新、领料同事务扣实物库存与预留；旧库自动迁移）
   geometry.js            精确几何校验、覆盖/缺口分析、铅条合并
   leaddiff.js            两版铅条核对（整数直线分组、区间沿用/取消/新增、拆分）
   cutting.js             铅条切段排产（0.01mm 整数运算、FFD、刀损）
   printsheet.js          1:1 分张打印（整数毫米分页、拼接标记、逐页 SVG/毫米标尺）
   sheetnest.js           玻璃裁片排样（整数/BigInt 精确净距、90°旋转、左下角首次适应、60 张上限）
 public/
-  index.html / style.css / app.js   单页前端（Canvas 编辑器/发布视图/版本核对/分张打印/铅条生产/玻璃裁片/整套备料/库存盘点）
+  index.html / style.css / app.js   单页前端（Canvas 编辑器/发布视图/版本核对/分张打印/铅条生产/玻璃裁片/整套备料/库存盘点/领料出库）
 test/
   geometry.test.js       几何算法测试（node --test）
   leaddiff.test.js       两版核对：反向/顺序/T接归一、部分重叠拆分、斜向合计舍入、非同图纸报错
@@ -742,4 +848,5 @@ test/
   cutreplace.test.js     换单端到端（预览只读、原子换单、短缺回滚、幂等/冲突、旧单终态、并发不超卖、换单链）
   comboorders.api.test.js 整套用料单端到端（预览只读、两类原子预留/短缺回滚、幂等/冲突、关联单锁定、取消各释放一次、并发不超卖、快照绑定、独立入口不受影响）
   stocktakes.api.test.js 库存盘点端到端（预览固化基准不改库存、基准不符/低于预留整单拒绝、一次更新、重复提交幂等、盘点后独立/整套单口径、并发不双重调整、调整入口继续可用）
+  requisitions.api.test.js 领料出库端到端（分次领料同事务扣库存与预留、本次/累计/余留、非法整次不生效、同号幂等/冲突、已领不能取消/换单、整套可只领一类、历史查询、盘点与手工调整结转口径、并发同号不重复扣）
 ```

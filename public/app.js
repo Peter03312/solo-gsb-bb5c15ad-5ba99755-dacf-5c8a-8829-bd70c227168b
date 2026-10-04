@@ -713,6 +713,7 @@ function switchTab(which) {
   document.getElementById('tabCutting').classList.toggle('active', which === 'cutting');
   document.getElementById('tabCombo').classList.toggle('active', which === 'combo');
   document.getElementById('tabStocktake').classList.toggle('active', which === 'stocktake');
+  document.getElementById('tabRequisition').classList.toggle('active', which === 'requisition');
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
   document.getElementById('viewDiff').hidden = which !== 'diff';
@@ -721,6 +722,7 @@ function switchTab(which) {
   document.getElementById('viewCutting').hidden = which !== 'cutting';
   document.getElementById('viewCombo').hidden = which !== 'combo';
   document.getElementById('viewStocktake').hidden = which !== 'stocktake';
+  document.getElementById('viewRequisition').hidden = which !== 'requisition';
   if (which === 'published') loadPubVersions();
   if (which === 'diff') enterDiff();
   if (which === 'print') enterPrint();
@@ -728,6 +730,7 @@ function switchTab(which) {
   if (which === 'cutting') enterCutting();
   if (which === 'combo') enterCombo();
   if (which === 'stocktake') enterStocktake();
+  if (which === 'requisition') enterRequisition();
 }
 
 (async function init() {
@@ -1008,13 +1011,14 @@ function renderMaterials() {
     el.innerHTML = '<div class="hint">尚未登记原材。</div>';
     return;
   }
-  let html = '<table><thead><tr><th>规格</th><th class="num">定尺</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>规格</th><th class="num">定尺</th><th class="num">库存</th><th class="num">已预留</th><th class="num">已领出</th><th class="num">可用</th><th></th></tr></thead><tbody>';
   for (const m of prod.materials) {
     html += `<tr>
       <td>${escapeHtml(m.name)}</td>
       <td class="num">${fmt(m.length)}</td>
       <td class="num">${m.stock}</td>
       <td class="num">${m.reserved}</td>
+      <td class="num">${m.drawn ?? 0}</td>
       <td class="num"><b>${m.available}</b></td>
       <td><input type="number" min="0" step="1" value="${m.stock}" class="stock-edit" data-id="${m.id}" style="width:72px"></td>
     </tr>`;
@@ -1179,6 +1183,10 @@ function renderLayout(detail, mode) {
   if (p.comboId) {
     html += `<div class="stock-badge replace">🔗 该计划属于整套用料单 #${p.comboId}，只能随整套单取消；此处不能单独取消、修改或删除。</div>`;
   }
+  if (!isPreview && p.status === 'confirmed' && !p.comboId) {
+    html += `<div class="stock-badge replace">📤 领料：需求 <b>${p.requiredBars}</b> 根 · 累计已领 <b>${p.drawnBars || 0}</b> 根 ·
+      尚未领出 <b>${p.remainingBars ?? p.requiredBars}</b> 根。已领料后不能取消。</div>`;
+  }
 
   html += `<div class="muted">共 ${L.totals.segmentCount} 段；成品合计 ${fmt(L.totals.finishedLength)} mm，
     刀损合计 ${fmt(L.totals.kerfTotal)} mm，余料合计 ${fmt(L.totals.remainderTotal)} mm。</div>`;
@@ -1207,13 +1215,17 @@ function renderLayout(detail, mode) {
       <button id="btnPlanDelete" class="danger">删除草稿</button>
       <button id="btnPlanReedit">按此参数重新编辑</button></div>`;
   } else if (p.status === 'confirmed') {
-    html += `<div class="btn-row"><button id="btnPlanCancel" class="danger">取消计划（释放预留）</button></div>`;
+    html += `<div class="btn-row">
+      <button id="btnPlanRequisition" class="primary">分次领料</button>
+      <button id="btnPlanCancel" class="danger">取消计划（释放预留）</button></div>`;
   }
 
   document.getElementById('previewContent').innerHTML = html;
 
   const saveBtn = document.getElementById('btnSaveDraft');
   if (saveBtn) saveBtn.addEventListener('click', () => saveDraft(detail));
+  const rqBtn = document.getElementById('btnPlanRequisition');
+  if (rqBtn) rqBtn.addEventListener('click', () => jumpToRequisition('plan', p.id));
   const cf = document.getElementById('btnPlanConfirm');
   if (cf) cf.addEventListener('click', () => confirmPlan(p.id));
   const de = document.getElementById('btnPlanDelete');
@@ -1337,8 +1349,11 @@ function renderPlanList() {
       ? ` <span class="gap-info">缺 ${p.shortage} 根</span>` : '';
     const comboTag = p.comboId
       ? ` <span class="muted small">🔗 整套 #${p.comboId}</span>` : '';
+    const drawnTag = p.status === 'confirmed' && p.drawnBars > 0
+      ? ` <span class="badge" style="background:#e3f2fd;color:#1565c0">已领 ${p.drawnBars}/${p.requiredBars} · 余 ${p.remainingBars}</span>`
+      : '';
     return `<div class="plan-item${prod.detailPlan === p.id ? ' active' : ''}" data-id="${p.id}">
-      <div>${badge} <b>#${p.id}</b> ${escapeHtml(p.name)}${warn}${comboTag}</div>
+      <div>${badge} <b>#${p.id}</b> ${escapeHtml(p.name)}${warn}${comboTag}${drawnTag}</div>
       <div class="muted small">v${p.version} · ${p.copies}件 · 用 ${p.requiredBars} 根 ·
         ${escapeHtml(p.material ? p.material.name : '规格已删')}</div>
     </div>`;
@@ -1691,13 +1706,14 @@ function renderGlassList() {
     el.innerHTML = '<div class="hint">尚未登记颜色原片。每种颜色仅可登记一种宽×高规格。</div>';
     return;
   }
-  let html = '<table><thead><tr><th>颜色</th><th class="num">宽×高</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>颜色</th><th class="num">宽×高</th><th class="num">库存</th><th class="num">已预留</th><th class="num">已领出</th><th class="num">可用</th><th></th></tr></thead><tbody>';
   for (const s of cut.sheets) {
     html += `<tr>
       <td><span class="color-chip" style="background:${s.color}"></span>${s.color}</td>
       <td class="num">${s.width}×${s.height}</td>
       <td class="num">${s.stock}</td>
       <td class="num">${s.reserved}</td>
+      <td class="num">${s.drawn ?? 0}</td>
       <td class="num"><b>${s.available}</b></td>
       <td><input type="number" min="0" step="1" value="${s.stock}" class="glass-stock" data-id="${s.id}" style="width:72px"></td>
     </tr>`;
@@ -1843,7 +1859,8 @@ function renderCutDetail(mode) {
       总裁片数 <b>${p.totalSheets}</b> / ${p.maxSheets} 张</div></div>`;
   html += cutStockBadge(p, isPreview);
 
-  html += '<div class="cut-color-summary"><table><thead><tr><th>颜色</th><th class="num">原片宽×高</th><th class="num">用板</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th class="num">缺口</th></tr></thead><tbody>';
+  html += '<div class="cut-color-summary"><table><thead><tr><th>颜色</th><th class="num">原片宽×高</th><th class="num">用板</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th class="num">缺口</th>'
+    + (isPreview ? '' : '<th class="num">已领</th><th class="num">余留</th>') + '</tr></thead><tbody>';
   for (const c of p.colors) {
     html += `<tr>
       <td><span class="color-chip" style="background:${c.color}"></span>${c.color}</td>
@@ -1853,9 +1870,14 @@ function renderCutDetail(mode) {
       <td class="num">${c.reserved}</td>
       <td class="num">${c.available}</td>
       <td class="num">${c.shortage > 0 ? `<span class="gap-info">${c.shortage}</span>` : 0}</td>
+      ${isPreview ? '' : `<td class="num">${c.drawnSheets || 0}</td><td class="num"><b>${c.remainingSheets ?? c.requiredSheets}</b></td>`}
     </tr>`;
   }
   html += '</tbody></table></div>';
+  if (!isPreview && p.status === 'confirmed' && !p.comboId) {
+    html += `<div class="stock-badge replace">📤 领料：共需求 <b>${p.totalSheets}</b> 张 · 累计已领 <b>${p.drawnSheets || 0}</b> 张 ·
+      尚未领出 <b>${p.remainingSheets ?? p.totalSheets}</b> 张。已领料后不能取消、不能换单。</div>`;
+  }
 
   // 逐张原片
   html += '<div class="cut-sheets">';
@@ -1885,7 +1907,9 @@ function renderCutDetail(mode) {
       <button id="btnCutConfirm" class="primary">确认订单（预留 ${p.totalSheets} 张）</button>
       <button id="btnCutDelete" class="danger">删除草稿</button></div>`;
   } else if (p.status === 'confirmed') {
-    html += '<div class="btn-row"><button id="btnCutCancel" class="danger">取消订单（释放预留）</button></div>';
+    html += `<div class="btn-row">
+      <button id="btnCutRequisition" class="primary">分次领料</button>
+      <button id="btnCutCancel" class="danger">取消订单（释放预留）</button></div>`;
     html += cutReplacePanel(p);
   } else if (p.status === 'replaced') {
     html += `<div class="replace-info">此订单为已替换的历史记录，发布快照与排样仍可查阅。
@@ -1903,6 +1927,8 @@ function renderCutDetail(mode) {
   if (cf) cf.addEventListener('click', () => confirmCutOrder(p.id));
   const de = document.getElementById('btnCutDelete');
   if (de) de.addEventListener('click', () => deleteCutOrder(p.id));
+  const rqb = document.getElementById('btnCutRequisition');
+  if (rqb) rqb.addEventListener('click', () => jumpToRequisition('order', p.id));
   const ca = document.getElementById('btnCutCancel');
   if (ca) ca.addEventListener('click', () => cancelCutOrder(p.id));
   const rp = document.getElementById('btnReplacePreview');
@@ -2165,8 +2191,11 @@ function renderCutOrderList() {
       ? ` <span class="muted small">⇄ 由 #${o.replacedBy?.newOrderId || '?'} 接替</span>`
       : o.replaces ? ` <span class="muted small">⇄ 接替 #${o.replaces.oldOrderId}</span>` : '';
     const comboTag = o.comboId ? ` <span class="muted small">🔗 整套 #${o.comboId}</span>` : '';
+    const drawnTag = o.status === 'confirmed' && o.drawnSheets > 0
+      ? ` <span class="badge" style="background:#e3f2fd;color:#1565c0">已领 ${o.drawnSheets}/${o.totalSheets} · 余 ${o.remainingSheets}</span>`
+      : '';
     return `<div class="plan-item${cut.detailId === o.id ? ' active' : ''}" data-id="${o.id}">
-      <div>${badge} <b>#${o.id}</b> ${escapeHtml(o.name)}${warn}</div>
+      <div>${badge} <b>#${o.id}</b> ${escapeHtml(o.name)}${warn}${drawnTag}</div>
       <div class="muted small">v${o.version} · ${o.copies}件 · 间距 ${o.gap}mm · ${o.totalSheets} 张 ${colors}${rel}${comboTag}</div>
     </div>`;
   }).join('');
@@ -2406,8 +2435,11 @@ function renderComboList() {
     const badge = c.status === 'confirmed'
       ? '<span class="badge ok">已确认</span>'
       : '<span class="badge" style="background:#eee;color:#888">已取消</span>';
+    const drawnTag = c.status === 'confirmed' && c.requisitioned
+      ? ` <span class="badge" style="background:#e3f2fd;color:#1565c0">已领 铅${c.drawnBars || 0}/${c.requiredBars} · 玻${c.drawnSheets || 0}/${c.totalSheets}</span>`
+      : '';
     return `<div class="plan-item${combo.detailId === c.id ? ' active' : ''}" data-id="${c.id}">
-      <div>${badge} <b>#${c.id}</b> ${escapeHtml(c.name)}</div>
+      <div>${badge} <b>#${c.id}</b> ${escapeHtml(c.name)}${drawnTag}</div>
       <div class="muted small">v${c.version} · ${c.copies}件 · 铅条 ${c.requiredBars} 根 · 玻璃 ${c.totalSheets} 张
         · 计划 #${c.leadPlanId} / 订单 #${c.cutOrderId}</div>
     </div>`;
@@ -2435,6 +2467,12 @@ function renderComboDetail(c) {
     ? '<div class="stock-badge ok">✓ 两类库存已在同一事务内核验并预留；关联单不可单独取消/修改/换单</div>'
     : '<div class="stock-badge cancel">已取消：关联生产计划与裁片订单同时取消，铅条与玻璃预留各释放一次（重复取消不重复变更）</div>';
 
+  if (c.status === 'confirmed') {
+    html += `<div class="stock-badge replace">📤 领料：铅条需求 <b>${c.requiredBars}</b> 根（已领 <b>${c.drawnBars || 0}</b> · 余留 <b>${c.remainingBars ?? c.requiredBars}</b>）；
+      玻璃需求 <b>${c.totalSheets}</b> 张（已领 <b>${c.drawnSheets || 0}</b> · 余留 <b>${c.remainingSheets ?? c.totalSheets}</b>）。
+      整套单允许只领其中一类；任一类已领即不能取消。</div>`;
+  }
+
   html += `<div class="replace-info">关联生产计划：<b>#${c.leadPlanId}</b>「${escapeHtml(lp ? lp.name : '')}」（${lp ? lp.statusText : '?'}，${c.requiredBars} 根）
     —— 仅可查阅，不能从“铅条生产”入口单独取消/修改/删除。</div>`;
   html += `<div class="replace-info">关联裁片订单：<b>#${c.cutOrderId}</b>「${escapeHtml(co ? co.name : '')}」（${co ? co.statusText : '?'}，${c.totalSheets} 张）
@@ -2458,9 +2496,13 @@ function renderComboDetail(c) {
   html += '</div></details>';
 
   if (c.status === 'confirmed') {
-    html += `<div class="btn-row"><button id="btnComboCancel" class="danger big">取消整套单（两类预留各释放一次）</button></div>`;
+    html += `<div class="btn-row">
+      <button id="btnComboRequisition" class="primary big">分次领料（可只领铅条或玻璃一类）</button>
+      <button id="btnComboCancel" class="danger big">取消整套单（两类预留各释放一次）</button></div>`;
   }
   document.getElementById('comboPreviewContent').innerHTML = html;
+  const rqb = document.getElementById('btnComboRequisition');
+  if (rqb) rqb.addEventListener('click', () => jumpToRequisition('combo', c.id));
   const btn = document.getElementById('btnComboCancel');
   if (btn) btn.addEventListener('click', () => cancelCombo(c.id));
 }
@@ -2750,3 +2792,225 @@ function stRenderDetail(s) {
 
 document.getElementById('tabStocktake').addEventListener('click', () => switchTab('stocktake'));
 document.getElementById('btnStPreview').addEventListener('click', () => previewStocktake(null));
+
+// ================= 领料出库（按已确认计划/订单/整套单分次领料） =================
+
+const rq = {
+  docType: 'plan',
+  docs: [],
+  current: null,   // 选中的单据（序列化对象）
+  remaining: null, // 剩余预留
+  history: [],
+};
+
+function rqBanner(kind, msg) {
+  const b = document.getElementById('rqBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.innerHTML = msg;
+  clearTimeout(rqBanner._t);
+  if (kind === 'success') rqBanner._t = setTimeout(() => { b.hidden = true; }, 4000);
+}
+
+// 从计划/订单/整套详情跳到“领料出库”标签并预选该单据
+function jumpToRequisition(docType, docId) {
+  rq.docType = docType;
+  rq.current = null;
+  document.getElementById('tabRequisition').click();
+  // enterRequisition 会按 docType 拉列表；稍后选中目标单据
+  setTimeout(async () => {
+    document.getElementById('rqDocType').value = docType;
+    await rqLoadDocs();
+    const sel = document.getElementById('rqDocSelect');
+    sel.value = String(docId);
+    if (sel.value === String(docId)) await rqSelectDoc();
+  }, 0);
+}
+
+async function enterRequisition() {
+  rqBanner(false);
+  document.getElementById('rqDocType').value = rq.docType;
+  await rqLoadDocs();
+  await rqLoadHistory();
+}
+
+async function rqLoadDocs() {
+  const urlMap = {
+    plan: '/api/plans',
+    order: '/api/cut-orders',
+    combo: '/api/combo-orders',
+  };
+  const keyMap = { plan: 'plans', order: 'orders', combo: 'combos' };
+  const data = await api('GET', urlMap[rq.docType]);
+  rq.docs = data[keyMap[rq.docType]].filter((x) => x.status === 'confirmed');
+  const sel = document.getElementById('rqDocSelect');
+  if (!rq.docs.length) {
+    sel.innerHTML = '<option value="">（暂无已确认单据）</option>';
+    rq.current = null;
+    rqRenderForm();
+    return;
+  }
+  sel.innerHTML = rq.docs.map((d) => {
+    const label = rq.docType === 'plan'
+      ? `#${d.id} ${d.name}（v${d.version} ×${d.copies}件 · 铅条 ${d.requiredBars} 根）`
+      : rq.docType === 'order'
+        ? `#${d.id} ${d.name}（v${d.version} ×${d.copies}件 · 玻璃 ${d.totalSheets} 张${d.comboId ? ' 🔗' : ''}）`
+        : `#${d.id} ${d.name}（v${d.version} ×${d.copies}件 · 铅条 ${d.requiredBars} 根 + 玻璃 ${d.totalSheets} 张）`;
+    return `<option value="${d.id}">${escapeHtml(label)}</option>`;
+  }).join('');
+  if (!rq.current || !rq.docs.some((d) => d.id === rq.current.id)) rq.current = rq.docs[0];
+  sel.value = rq.current.id;
+  await rqSelectDoc();
+}
+
+async function rqSelectDoc() {
+  const id = Number(document.getElementById('rqDocSelect').value);
+  rq.current = rq.docs.find((d) => d.id === id) || null;
+  if (!rq.current) { rqRenderForm(); return; }
+  const r = await api('GET', `/api/${rqDocPath()}/${id}/requisitions/remaining`);
+  rq.remaining = r.data.remaining;
+  rqRenderForm();
+}
+
+function rqDocPath() {
+  return rq.docType === 'plan' ? 'plans' : rq.docType === 'order' ? 'cut-orders' : 'combo-orders';
+}
+
+function rqDocName() {
+  return rq.docType === 'plan' ? '独立铅条计划' : rq.docType === 'order' ? '独立裁片订单' : '整套用料单';
+}
+
+function rqRenderForm() {
+  const form = document.getElementById('rqForm');
+  const detail = document.getElementById('rqDetail');
+  if (!rq.current) {
+    form.innerHTML = '';
+    detail.className = 'hint';
+    detail.innerHTML = '该类型下暂无已确认单据。';
+    return;
+  }
+  const c = rq.current;
+  const rem = rq.remaining;
+  let html = '<div class="form-row"><label>唯一领料号<input id="rqCode" type="text" placeholder="如 LL-20261004-001" maxlength="80"></label></div>';
+
+  if (rem.lead) {
+    html += `<div class="stock-badge ${rem.lead.remainingBars > 0 ? 'ok' : 'cancel'}">
+      铅条：需求 <b>${rem.lead.requiredBars}</b> 根 · 累计已领 <b>${rem.lead.drawnBars}</b> 根 ·
+      尚未领出（余留）<b>${rem.lead.remainingBars}</b> 根
+      ${rem.lead.materialName ? ` · ${escapeHtml(rem.lead.materialName)}` : ''}</div>`;
+    html += `<div class="form-row"><label>本次铅条根数（0–${rem.lead.remainingBars}）
+      <input id="rqLeadBars" type="number" min="0" step="1" value="0"></label></div>`;
+  }
+
+  if (rem.glass && rem.glass.colors.length) {
+    html += `<div class="stock-badge ${rem.glass.totalRemaining > 0 ? 'ok' : 'cancel'}">
+      玻璃原片：共需求 <b>${rem.glass.totalRequired}</b> 张 · 累计已领 <b>${rem.glass.totalDrawn}</b> 张 ·
+      尚未领出（余留）<b>${rem.glass.totalRemaining}</b> 张</div>`;
+    html += '<table><thead><tr><th>颜色/规格</th><th class="num">需求</th><th class="num">已领</th><th class="num">余留</th><th class="num">本次张数</th></tr></thead><tbody>';
+    for (const col of rem.glass.colors) {
+      html += `<tr>
+        <td><span class="color-chip" style="background:${col.color}"></span>${col.color}
+          <span class="muted small">${col.sheetWidth}×${col.sheetHeight} mm</span></td>
+        <td class="num">${col.requiredSheets}</td>
+        <td class="num">${col.drawnSheets}</td>
+        <td class="num"><b>${col.remainingSheets}</b></td>
+        <td><input type="number" min="0" step="1" value="0" data-sheet="${col.sheetId}" data-color="${col.color}"
+          data-remaining="${col.remainingSheets}" class="rq-glass-qty" style="width:80px"></td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+  }
+
+  html += '<div class="btn-row"><button id="btnRqSubmit" class="primary big">提交领料（同事务扣库存与预留）</button></div>';
+  form.innerHTML = html;
+  document.getElementById('btnRqSubmit').addEventListener('click', rqSubmit);
+
+  // 右侧详情：余留 + 已有领料历史
+  let dh = `<div class="plan-head"><div><b>${rqDocName()} #${c.id} · ${escapeHtml(c.name)}</b></div></div>`;
+  dh += '<div class="hint">提交在同一事务内扣减实物库存与该单对应预留；任一项不合法则整次不生效。同领料号同内容重试返回原记录，内容不同报冲突。</div>';
+  document.getElementById('rqDetail').className = '';
+  document.getElementById('rqDetail').innerHTML = dh;
+}
+
+async function rqSubmit() {
+  if (!rq.current) return;
+  const code = document.getElementById('rqCode').value.trim();
+  if (!code) { rqBanner('error', '⛔ 请填写唯一领料号'); return; }
+  const body = { code };
+  const leadEl = document.getElementById('rqLeadBars');
+  if (leadEl) body.leadBars = Number(leadEl.value);
+  const glass = [];
+  document.querySelectorAll('.rq-glass-qty').forEach((inp) => {
+    const n = Number(inp.value);
+    if (Number.isInteger(n) && n > 0) glass.push({ sheetId: Number(inp.dataset.sheet), sheets: n });
+  });
+  if (glass.length) body.glass = glass;
+
+  const leadBars = body.leadBars || 0;
+  if (leadBars === 0 && glass.length === 0) {
+    rqBanner('error', '⛔ 本次数量为非负整数且至少一项大于零');
+    return;
+  }
+  if (!Number.isInteger(leadBars) || leadBars < 0 || glass.some((g) => !Number.isInteger(g.sheets) || g.sheets < 0)) {
+    rqBanner('error', '⛔ 数量必须是非负整数');
+    return;
+  }
+
+  try {
+    const r = await api('POST', `/api/${rqDocPath()}/${rq.current.id}/requisitions`, body);
+    const t = r.data.thisTime;
+    const parts = [];
+    if (t.leadBars > 0) parts.push(`铅条 ${t.leadBars} 根`);
+    for (const g of t.glass) parts.push(`${g.color} ${g.sheets} 张`);
+    const rem = r.data.remaining;
+    const remParts = [];
+    if (rem.lead) remParts.push(`铅条余留 ${rem.lead.remainingBars} 根`);
+    if (rem.glass) remParts.push(`玻璃余留 ${rem.glass.totalRemaining} 张`);
+    rqBanner('success', `${r.data.idempotent ? '该领料号已提交过，返回原记录（未重复扣减）' : '✓ 领料成功'}：本次 ${parts.join('、')}；${remParts.join('、')}。`);
+    await rqLoadDocs();
+    await rqLoadHistory();
+  } catch (err) {
+    const d = err.data || {};
+    let txt = '⛔ ' + (d.error || err.message);
+    if (d.code === 'exceeds_remaining' && Array.isArray(d.shortages)) {
+      txt += '<br>' + d.shortages.map((s) =>
+        `${s.color}：需 ${s.required}、已领 ${s.drawn}、余留 ${s.remaining}，本次 ${s.requested}`).join('<br>');
+    }
+    rqBanner('error', txt);
+    await rqSelectDoc();
+  }
+}
+
+function rqRenderRecord(rec) {
+  const lead = rec.lines.lead.map((l) => `${escapeHtml(l.materialName || `#${l.materialId}`)} ×${l.bars} 根`).join('；');
+  const glass = rec.lines.glass.map((g) => `<span class="color-chip" style="background:${g.color}"></span>${g.color} ×${g.sheets} 张`).join('；');
+  return `<div class="plan-item">
+    <div><b>${escapeHtml(rec.code)}</b> <span class="badge ok">${rec.docTypeText}</span>
+      <span class="muted small">单据 #${rec.docId} · ${rec.createdAt}</span></div>
+    <div class="small">${lead ? `铅条：${lead}` : ''}${lead && glass ? '<br>' : ''}${glass || ''}</div>
+  </div>`;
+}
+
+async function rqLoadHistory(url) {
+  const data = await api('GET', url || '/api/requisitions');
+  rq.history = data.requisitions;
+  const el = document.getElementById('rqHistoryList');
+  if (!rq.history.length) { el.innerHTML = '<div class="hint">暂无领料记录。</div>'; return; }
+  el.innerHTML = `<div class="muted small">共 ${rq.history.length} 条（最新在前）</div>` +
+    rq.history.map(rqRenderRecord).join('');
+}
+
+document.getElementById('tabRequisition').addEventListener('click', () => switchTab('requisition'));
+document.getElementById('rqDocType').addEventListener('change', async () => {
+  rq.docType = document.getElementById('rqDocType').value;
+  rq.current = null;
+  await rqLoadDocs();
+});
+document.getElementById('rqDocSelect').addEventListener('change', rqSelectDoc);
+document.getElementById('btnRqAll').addEventListener('click', () => rqLoadHistory('/api/requisitions'));
+document.getElementById('btnRqSearch').addEventListener('click', async () => {
+  const code = document.getElementById('rqSearchCode').value.trim();
+  if (!code) { rqBanner('error', '⛔ 请输入要查询的领料号'); return; }
+  await rqLoadHistory(`/api/requisitions?code=${encodeURIComponent(code)}`);
+});
