@@ -210,6 +210,33 @@ function init(dbPath) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_stockitems_st ON stocktake_items(stocktake_id);
+
+    -- 领料记录：工作室按已确认的独立铅条计划 / 独立裁片订单 / 整套用料单分次领料。
+    -- 一次确认在同一事务内扣减实物库存（stock）与对应预留（记录行不可变、不可取消）。
+    -- issue_no 为调用方提供的唯一领料号（同号同内容重试返回原记录，同号不同内容冲突）。
+    -- 一次领料可能同时领铅条与多色玻璃（多行同一 issue_no），故 issue_no 不加 UNIQUE；
+    -- 唯一性由 BEGIN IMMEDIATE 写事务 + 同号查重保证（并发请求被写锁串行化）。
+    CREATE TABLE IF NOT EXISTS stock_issues (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      issue_no        TEXT    NOT NULL,
+      source_type     TEXT    NOT NULL CHECK (source_type IN ('lead_plan','cut_order','combo')),
+      plan_id         INTEGER,                       -- 铅条计划（独立计划或整套关联计划）
+      order_id        INTEGER,                       -- 裁片订单（独立订单或整套关联订单）
+      combo_id        INTEGER,                       -- 整套单 id（整套领料时非空）
+      material_id     INTEGER,                       -- 铅条规格
+      lead_bars       INTEGER NOT NULL DEFAULT 0 CHECK (lead_bars >= 0),
+      sheet_id        INTEGER,                       -- 玻璃原片规格（一条一行某色）
+      sheet_color     TEXT,
+      sheets_count    INTEGER NOT NULL DEFAULT 0 CHECK (sheets_count >= 0),
+      created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_issues_plan   ON stock_issues(plan_id);
+    CREATE INDEX IF NOT EXISTS idx_issues_order  ON stock_issues(order_id);
+    CREATE INDEX IF NOT EXISTS idx_issues_combo  ON stock_issues(combo_id);
+    CREATE INDEX IF NOT EXISTS idx_issues_mat    ON stock_issues(material_id);
+    CREATE INDEX IF NOT EXISTS idx_issues_sheet  ON stock_issues(sheet_id);
+    CREATE INDEX IF NOT EXISTS idx_issues_no     ON stock_issues(issue_no);
   `);
 
   // 旧库迁移：早期 cut_orders 的状态 CHECK 不含 'replaced'，也没有 replaced_at 列。
@@ -226,7 +253,45 @@ function init(dbPath) {
     CREATE INDEX IF NOT EXISTS idx_cutorders_combo ON cut_orders(combo_id);
   `);
 
+  // 早期领料表 issue_no 带 UNIQUE（一次领料多行需同号）；检测到旧定义则重建。
+  migrateStockIssues();
+
   return db;
+}
+
+// 旧库迁移：stock_issues.issue_no 早期为 UNIQUE，重建为普通列 + 索引（唯一性改由写事务保证）。
+function migrateStockIssues() {
+  const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='stock_issues'").get();
+  if (!ddl || !/issue_no\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(ddl.sql || '')) return;
+  db.exec(`
+    ALTER TABLE stock_issues RENAME TO stock_issues_old;
+    CREATE TABLE stock_issues (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      issue_no        TEXT    NOT NULL,
+      source_type     TEXT    NOT NULL CHECK (source_type IN ('lead_plan','cut_order','combo')),
+      plan_id         INTEGER,
+      order_id        INTEGER,
+      combo_id        INTEGER,
+      material_id     INTEGER,
+      lead_bars       INTEGER NOT NULL DEFAULT 0 CHECK (lead_bars >= 0),
+      sheet_id        INTEGER,
+      sheet_color     TEXT,
+      sheets_count    INTEGER NOT NULL DEFAULT 0 CHECK (sheets_count >= 0),
+      created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO stock_issues
+      (id, issue_no, source_type, plan_id, order_id, combo_id, material_id, lead_bars,
+       sheet_id, sheet_color, sheets_count, created_at)
+    SELECT id, issue_no, source_type, plan_id, order_id, combo_id, material_id, lead_bars,
+       sheet_id, sheet_color, sheets_count, created_at FROM stock_issues_old;
+    DROP TABLE stock_issues_old;
+    CREATE INDEX IF NOT EXISTS idx_issues_plan  ON stock_issues(plan_id);
+    CREATE INDEX IF NOT EXISTS idx_issues_order ON stock_issues(order_id);
+    CREATE INDEX IF NOT EXISTS idx_issues_combo ON stock_issues(combo_id);
+    CREATE INDEX IF NOT EXISTS idx_issues_mat   ON stock_issues(material_id);
+    CREATE INDEX IF NOT EXISTS idx_issues_sheet ON stock_issues(sheet_id);
+    CREATE INDEX IF NOT EXISTS idx_issues_no    ON stock_issues(issue_no);
+  `);
 }
 
 // 为旧库补 combo_id 列（NULL = 独立计划/订单；非空 = 属于某整套单，受整单状态机约束）。
@@ -451,15 +516,18 @@ function reservedMap() {
 }
 
 function listMaterials() {
-  const reserved = reservedMap();
   return getDb()
     .prepare('SELECT * FROM lead_materials ORDER BY id')
     .all()
     .map((r) => {
       const m = rowToMaterial(r);
-      const used = reserved.get(r.id) || 0;
-      m.reserved = used;
-      m.available = m.stock - used;
+      const used = reservedMap().get(r.id) || 0;
+      const picked = leadPickedForMaterial(r.id);
+      m.reserved = used - picked;       // 尚未领出的预留量（净预留）
+      m.grossReserved = used;           // 已确认单预留总量
+      m.picked = picked;                // 已领出根数
+      m.remainingReserved = used - picked;
+      m.available = m.stock - m.reserved;
       return m;
     });
 }
@@ -472,11 +540,15 @@ function getMaterial(id) {
   const row = getMaterialRow(id);
   if (!row) return null;
   const m = rowToMaterial(row);
-  const reserved = getDb()
+  const gross = getDb()
     .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
     .get(id).n;
-  m.reserved = reserved;
-  m.available = m.stock - reserved;
+  const picked = leadPickedForMaterial(id);
+  m.grossReserved = gross;
+  m.picked = picked;
+  m.remainingReserved = gross - picked;
+  m.reserved = gross - picked; // 尚未领出的预留量（净预留）
+  m.available = m.stock - m.reserved;
   return m;
 }
 
@@ -498,9 +570,10 @@ function updateMaterial(id, { name, stock }) {
   const txn = d.transaction(() => {
     const row = getMaterialRow(id);
     if (!row) return { code: 'not_found' };
-    const reserved = d
+    const gross = d
       .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
       .get(id).n;
+    const reserved = gross - leadPickedForMaterial(id);
     if (stock !== undefined && stock < reserved) {
       return { code: 'stock_below_reserved', reserved };
     }
@@ -613,10 +686,10 @@ function confirmPlan(id) {
     if (mat.length_h !== row.material_length_h) {
       d.exec('ROLLBACK'); return { code: 'material_changed' };
     }
-    const reserved = d
+    const gross = d
       .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
       .get(row.material_id).n;
-    const available = mat.stock - reserved;
+    const available = mat.stock - (gross - leadPickedForMaterial(row.material_id));
     if (row.required_bars > available) {
       d.exec('ROLLBACK');
       return { code: 'shortage', available, required: row.required_bars, shortage: row.required_bars - available };
@@ -640,6 +713,7 @@ function cancelPlan(id) {
   if (row.combo_id) return { code: 'combo_locked', comboId: row.combo_id };
   if (row.status === 'draft') return { code: 'draft_not_reserved' };
   if (row.status === 'canceled') return { code: 'already_canceled' };
+  if (planHasIssues(row.id)) return { code: 'already_issued', picked: leadPickedForPlan(row.id) };
   d.exec('BEGIN IMMEDIATE');
   try {
     d.prepare(`UPDATE lead_plans
@@ -678,7 +752,7 @@ function rowToGlassSheet(row, reserved = 0) {
   };
 }
 
-// 各颜色已被已确认订单预留的张数
+// 各颜色已被已确认订单预留的张数（总量）
 function glassReservedMap() {
   const rows = getDb()
     .prepare(`SELECT i.sheet_id AS id, COALESCE(SUM(i.required_sheets), 0) AS reserved
@@ -692,10 +766,30 @@ function glassReservedMap() {
   return m;
 }
 
+// 各颜色已领出张数
+function glassPickedMap() {
+  const rows = getDb()
+    .prepare(`SELECT sheet_id AS id, COALESCE(SUM(sheets_count),0) AS picked
+              FROM stock_issues WHERE sheet_id IS NOT NULL GROUP BY sheet_id`)
+    .all();
+  const m = new Map();
+  for (const r of rows) m.set(r.id, r.picked);
+  return m;
+}
+
 function listGlassSheets() {
   const reserved = glassReservedMap();
+  const picked = glassPickedMap();
   return getDb().prepare('SELECT * FROM glass_sheets ORDER BY color').all()
-    .map((r) => rowToGlassSheet(r, reserved.get(r.id) || 0));
+    .map((r) => {
+      const gross = reserved.get(r.id) || 0;
+      const got = picked.get(r.id) || 0;
+      const s = rowToGlassSheet(r, gross - got);
+      s.grossReserved = gross;
+      s.picked = got;
+      s.remainingReserved = gross - got;
+      return s;
+    });
 }
 
 // 以颜色键取规格（含库存视图）
@@ -716,11 +810,16 @@ function getGlassSheetByColorRow(color) {
 function getGlassSheet(id) {
   const row = getGlassSheetRow(id);
   if (!row) return null;
-  const reserved = getDb()
+  const gross = getDb()
     .prepare(`SELECT COALESCE(SUM(i.required_sheets),0) AS n
               FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
               WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(id).n;
-  return rowToGlassSheet(row, reserved);
+  const picked = glassPickedForSheet(id);
+  const s = rowToGlassSheet(row, gross - picked); // reserved=尚未领出的预留量（净预留）
+  s.grossReserved = gross;
+  s.picked = picked;
+  s.remainingReserved = gross - picked;
+  return s;
 }
 
 function createGlassSheet({ color, width, height, stock }) {
@@ -736,10 +835,11 @@ function updateGlassSheetStock(id, stock) {
   const txn = d.transaction(() => {
     const row = getGlassSheetRow(id);
     if (!row) return { code: 'not_found' };
-    const reserved = d
+    const gross = d
       .prepare(`SELECT COALESCE(SUM(i.required_sheets),0) AS n
                 FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
                 WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(id).n;
+    const reserved = gross - glassPickedForSheet(id);
     if (stock < reserved) return { code: 'stock_below_reserved', reserved };
     d.prepare("UPDATE glass_sheets SET stock = ?, updated_at = datetime('now') WHERE id = ?").run(stock, id);
     return { code: 'ok', sheet: getGlassSheet(id) };
@@ -866,11 +966,11 @@ function confirmCutOrder(id) {
         d.exec('ROLLBACK');
         return { code: 'sheet_changed', color: it.sheet_color };
       }
-      const reserved = d
+      const gross = d
         .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
                   FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
                   WHERE ci.sheet_id = ? AND co.status = 'confirmed'`).get(it.sheet_id).n;
-      const available = sheet.stock - reserved;
+      const available = sheet.stock - (gross - glassPickedForSheet(it.sheet_id));
       if (it.required_sheets > available) {
         shortages.push({
           color: it.sheet_color,
@@ -904,6 +1004,7 @@ function cancelCutOrder(id) {
   if (row.status === 'draft') return { code: 'draft_not_reserved' };
   if (row.status === 'canceled') return { code: 'already_canceled' };
   if (row.status === 'replaced') return { code: 'order_replaced' };
+  if (orderHasIssues(row.id)) return { code: 'already_issued' };
   d.exec('BEGIN IMMEDIATE');
   try {
     d.prepare(`UPDATE cut_orders
@@ -982,6 +1083,11 @@ function replaceCutOrder(oldId, o) {
     if (oldRow.status === 'canceled') { d.exec('ROLLBACK'); return { code: 'order_canceled' }; }
     if (oldRow.status === 'draft') { d.exec('ROLLBACK'); return { code: 'order_not_confirmed' }; }
     if (oldRow.status !== 'confirmed') { d.exec('ROLLBACK'); return { code: 'order_replaced' }; }
+    // 已领料的独立裁片订单不能换单（已领实物不可逆）
+    if (orderHasIssues(oldId)) {
+      d.exec('ROLLBACK');
+      return { code: 'already_issued' };
+    }
 
     // 逐色核对：把旧单视为即将释放，故可用量 = stock − 其他已确认单预留 + 旧单自身预留
     const shortages = [];
@@ -1135,10 +1241,10 @@ function createComboOrder(c) {
     const mat = getMaterialRow(c.materialId);
     if (!mat) { d.exec('ROLLBACK'); return { code: 'material_missing' }; }
     if (mat.length_h !== c.materialLengthH) { d.exec('ROLLBACK'); return { code: 'material_changed' }; }
-    const leadReserved = d
+    const leadGross = d
       .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
       .get(c.materialId).n;
-    const leadAvailable = mat.stock - leadReserved;
+    const leadAvailable = mat.stock - (leadGross - leadPickedForMaterial(c.materialId));
     if (c.requiredBars > leadAvailable) {
       d.exec('ROLLBACK');
       return {
@@ -1156,11 +1262,11 @@ function createComboOrder(c) {
       if (sheet.width_mm !== it.width || sheet.height_mm !== it.height) {
         d.exec('ROLLBACK'); return { code: 'sheet_changed', color: it.color };
       }
-      const reserved = d
+      const gross = d
         .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
                   FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
                   WHERE ci.sheet_id = ? AND co.status = 'confirmed'`).get(it.sheetId).n;
-      const available = sheet.stock - reserved;
+      const available = sheet.stock - (gross - glassPickedForSheet(it.sheetId));
       if (it.requiredSheets > available) {
         glassShortages.push({
           color: it.color, required: it.requiredSheets,
@@ -1229,11 +1335,18 @@ function cancelComboOrder(id) {
   const row = getComboOrderRow(id);
   if (!row) return { code: 'not_found' };
   if (row.status === 'canceled') return { code: 'already_canceled' };
+  if (getDb().prepare('SELECT 1 AS x FROM stock_issues WHERE combo_id = ? LIMIT 1').get(id)) {
+    return { code: 'already_issued' };
+  }
   d.exec('BEGIN IMMEDIATE');
   try {
-    // 事务内重读状态，防止并发重复取消
+    // 事务内重读状态，防止并发重复取消/并发领料
     const cur = d.prepare('SELECT * FROM combo_orders WHERE id = ?').get(id);
     if (cur.status === 'canceled') { d.exec('ROLLBACK'); return { code: 'already_canceled' }; }
+    if (d.prepare('SELECT 1 AS x FROM stock_issues WHERE combo_id = ? LIMIT 1').get(id)) {
+      d.exec('ROLLBACK');
+      return { code: 'already_issued' };
+    }
 
     const pn = d.prepare(`UPDATE lead_plans
       SET status = 'canceled', canceled_at = datetime('now'), updated_at = datetime('now')
@@ -1287,18 +1400,19 @@ function listStocktakeItemRows(stocktakeId) {
     .all(stocktakeId);
 }
 
-// 单规格当前已被已确认计划/订单预留的数量（独立单与整套单关联单同一口径，按状态计）。
+// 单规格当前“尚未领出的预留量”（净预留 = 已确认预留 − 已领出；独立单与整套单同一口径）。
 function leadReservedFor(materialId) {
   return getDb()
     .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
-    .get(materialId).n;
+    .get(materialId).n - leadPickedForMaterial(materialId);
 }
 
 function glassReservedFor(sheetId) {
   return getDb()
     .prepare(`SELECT COALESCE(SUM(i.required_sheets),0) AS n
               FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
-              WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(sheetId).n;
+              WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(sheetId).n
+    - glassPickedForSheet(sheetId);
 }
 
 // 生成某一项的预览基准（系统库存、已确认预留、规格身份快照）。
@@ -1508,20 +1622,370 @@ function deleteStocktake(id) {
   return { code: 'ok' };
 }
 
+// ---------- 领料（按已确认的独立计划 / 独立裁片订单 / 整套单分次领料） ----------
+//
+// 口径：领料确认时在同一事务内同时
+//   1) 扣减实物库存 lead_materials.stock / glass_sheets.stock；
+//   2) 记录不可变领料行 stock_issues（只追加，从不更新/删除）。
+// “尚未领出的预留量（净预留）” = 已确认单预留总量 − 已领出量；新确认/盘点/手工调库
+// 一律按净预留计算，因此领料不改变其他单据可再预留的可用量。
+
+function getIssueRowsByNo(issueNo) {
+  return getDb().prepare('SELECT * FROM stock_issues WHERE issue_no = ? ORDER BY id').all(issueNo);
+}
+
+function listIssueRows(filter = {}) {
+  const where = [];
+  const args = [];
+  if (filter.planId) { where.push('plan_id = ?'); args.push(filter.planId); }
+  if (filter.orderId) { where.push('order_id = ?'); args.push(filter.orderId); }
+  if (filter.comboId) { where.push('combo_id = ?'); args.push(filter.comboId); }
+  const sql = 'SELECT * FROM stock_issues' +
+    (where.length ? ' WHERE ' + where.join(' AND ') : '') +
+    ' ORDER BY id DESC';
+  return getDb().prepare(sql).all(...args);
+}
+
+function listAllIssueRows() {
+  // 按领料号分组时倒序取
+  return getDb().prepare('SELECT * FROM stock_issues ORDER BY id DESC').all();
+}
+
+// 某铅条规格已领出根数
+function leadPickedForMaterial(materialId) {
+  return getDb()
+    .prepare('SELECT COALESCE(SUM(lead_bars),0) AS n FROM stock_issues WHERE material_id = ?')
+    .get(materialId).n;
+}
+
+// 某玻璃原片规格已领出张数
+function glassPickedForSheet(sheetId) {
+  return getDb()
+    .prepare('SELECT COALESCE(SUM(sheets_count),0) AS n FROM stock_issues WHERE sheet_id = ?')
+    .get(sheetId).n;
+}
+
+// 某铅条计划（含整套关联计划）已领出根数
+function leadPickedForPlan(planId) {
+  return getDb()
+    .prepare('SELECT COALESCE(SUM(lead_bars),0) AS n FROM stock_issues WHERE plan_id = ?')
+    .get(planId).n;
+}
+
+// 某裁片订单某颜色已领出张数
+function glassPickedForOrderSheet(orderId, sheetId) {
+  return getDb()
+    .prepare('SELECT COALESCE(SUM(sheets_count),0) AS n FROM stock_issues WHERE order_id = ? AND sheet_id = ?')
+    .get(orderId, sheetId).n;
+}
+
+function orderHasIssues(orderId) {
+  return getDb()
+    .prepare('SELECT 1 AS x FROM stock_issues WHERE order_id = ? LIMIT 1')
+    .get(orderId) !== undefined;
+}
+
+function planHasIssues(planId) {
+  return getDb()
+    .prepare('SELECT 1 AS x FROM stock_issues WHERE plan_id = ? LIMIT 1')
+    .get(planId) !== undefined;
+}
+
+// 从一组同号领料行归纳“内容”（用于幂等/冲突比较）：
+// { sourceType, planId, orderId, comboId, leadBars, glass: Map(sheetId -> count) }
+function issueContentFromRows(rows) {
+  const first = rows[0];
+  let leadBars = 0;
+  const glass = new Map();
+  for (const r of rows) {
+    leadBars += r.lead_bars;
+    if (r.sheet_id !== null) glass.set(r.sheet_id, (glass.get(r.sheet_id) || 0) + r.sheets_count);
+  }
+  return {
+    sourceType: first.source_type,
+    planId: first.plan_id,
+    orderId: first.order_id,
+    comboId: first.combo_id,
+    leadBars,
+    glass,
+  };
+}
+
+function issueContentEqual(rows, p) {
+  const c = issueContentFromRows(rows);
+  if (c.sourceType !== p.sourceType) return false;
+  // 整套单以 comboId 为准（行内 plan_id/order_id 为服务端解析的关联单，入参不带）
+  if (p.sourceType === 'combo') {
+    if (c.comboId !== (p.comboId ?? null)) return false;
+  } else if (c.planId !== (p.planId ?? null) || c.orderId !== (p.orderId ?? null)) {
+    return false;
+  }
+  if (c.leadBars !== p.leadBars) return false;
+  const want = new Map();
+  for (const g of p.glass) want.set(g.sheetId, (want.get(g.sheetId) || 0) + g.count);
+  if (c.glass.size !== want.size) return false;
+  for (const [sid, n] of want) {
+    if (c.glass.get(sid) !== n) return false;
+  }
+  return true;
+}
+
+// 领料确认：一个 BEGIN IMMEDIATE 事务内
+//   1) 同领料号已存在 → 内容相同幂等返回；不同返回 issue_no_conflict；
+//   2) 单据必须为已确认（独立计划/订单 combo_id 必须为空；整套单 status=confirmed）；
+//   3) 数量逐项不得超过该单剩余预留（本次可为 0，整套单允许只领一类）；
+//   4) 同事务扣减实物库存并追加不可变领料行；任一项不合法整体回滚。
+// p: { issueNo, sourceType:'lead_plan'|'cut_order'|'combo',
+//      planId?, orderId?, comboId?, leadBars:integer, glass:[{sheetId,color,count}] }
+function createStockIssue(p) {
+  const d = getDb();
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    // ---- 幂等 / 冲突 ----
+    const dupRows = d.prepare('SELECT * FROM stock_issues WHERE issue_no = ?').all(p.issueNo);
+    if (dupRows.length) {
+      d.exec('ROLLBACK');
+      if (!issueContentEqual(dupRows, p)) {
+        return { code: 'issue_no_conflict', existing: issueContentFromRows(dupRows) };
+      }
+      return { code: 'idempotent', issueNo: p.issueNo };
+    }
+
+    // ---- 解析领料来源 ----
+    let planRow = null;
+    let orderRow = null;
+    let comboRow = null;
+    if (p.sourceType === 'lead_plan') {
+      planRow = getPlanRow(p.planId);
+      if (!planRow) { d.exec('ROLLBACK'); return { code: 'not_found', kind: 'plan' }; }
+      if (planRow.combo_id) { d.exec('ROLLBACK'); return { code: 'issue_use_combo', comboId: planRow.combo_id }; }
+      if (planRow.status !== 'confirmed') {
+        d.exec('ROLLBACK');
+        return { code: 'source_not_confirmed', kind: 'plan', status: planRow.status };
+      }
+    } else if (p.sourceType === 'cut_order') {
+      orderRow = getCutOrderRow(p.orderId);
+      if (!orderRow) { d.exec('ROLLBACK'); return { code: 'not_found', kind: 'order' }; }
+      if (orderRow.combo_id) { d.exec('ROLLBACK'); return { code: 'issue_use_combo', comboId: orderRow.combo_id }; }
+      if (orderRow.status !== 'confirmed') {
+        d.exec('ROLLBACK');
+        return { code: 'source_not_confirmed', kind: 'order', status: orderRow.status };
+      }
+    } else {
+      comboRow = getComboOrderRow(p.comboId);
+      if (!comboRow) { d.exec('ROLLBACK'); return { code: 'not_found', kind: 'combo' }; }
+      if (comboRow.status !== 'confirmed') {
+        d.exec('ROLLBACK');
+        return { code: 'source_not_confirmed', kind: 'combo', status: comboRow.status };
+      }
+      planRow = getPlanRow(comboRow.lead_plan_id);
+      orderRow = getCutOrderRow(comboRow.cut_order_id);
+      if (!planRow || !orderRow || planRow.status !== 'confirmed' || orderRow.status !== 'confirmed') {
+        d.exec('ROLLBACK');
+        return { code: 'combo_links_broken' };
+      }
+    }
+
+    const problems = [];
+
+    // ---- 铅条核对 ----
+    if (p.leadBars > 0) {
+      if (!planRow) {
+        problems.push({ kind: 'lead', reason: 'no_lead_in_source', message: '该单不含铅条预留，不能领取铅条' });
+      } else {
+        const mat = getMaterialRow(planRow.material_id);
+        if (!mat) { d.exec('ROLLBACK'); return { code: 'material_missing' }; }
+        const pickedPlan = d
+          .prepare('SELECT COALESCE(SUM(lead_bars),0) AS n FROM stock_issues WHERE plan_id = ?')
+          .get(planRow.id).n;
+        const remainingPlan = planRow.required_bars - pickedPlan;
+        if (p.leadBars > remainingPlan) {
+          problems.push({
+            kind: 'lead', reason: 'over_remaining',
+            required: planRow.required_bars, picked: pickedPlan,
+            remaining: remainingPlan, requested: p.leadBars,
+            message: `本次领取 ${p.leadBars} 根，超过该单尚未领出的预留 ${remainingPlan} 根`,
+          });
+        }
+        // 实物库存必须足以覆盖全部净预留（其中含本单本次要领的部分）
+        const netReserved = leadNetReservedInTx(mat.id);
+        if (mat.stock < netReserved || mat.stock < p.leadBars) {
+          problems.push({
+            kind: 'lead', reason: 'physical_shortage',
+            stock: mat.stock, requested: p.leadBars,
+            message: `铅条实物库存仅 ${mat.stock} 根，不足以发放本次 ${p.leadBars} 根`,
+          });
+        }
+      }
+    }
+
+    // ---- 玻璃逐色核对 ----
+    const itemRows = orderRow
+      ? d.prepare('SELECT * FROM cut_order_items WHERE order_id = ?').all(orderRow.id)
+      : [];
+    const itemBySheet = new Map(itemRows.map((it) => [it.sheet_id, it]));
+    const glassDedup = new Map();
+    for (const g of p.glass) glassDedup.set(g.sheetId, (glassDedup.get(g.sheetId) || 0) + g.count);
+    for (const [sheetId, count] of glassDedup) {
+      if (!orderRow) {
+        problems.push({ kind: 'glass', sheetId, reason: 'no_glass_in_source', message: '该单不含玻璃预留，不能领取玻璃原片' });
+        continue;
+      }
+      const item = itemBySheet.get(sheetId);
+      if (!item) {
+        problems.push({ kind: 'glass', sheetId, reason: 'sheet_not_in_order', message: `原片规格 #${sheetId} 不在该单预留颜色中` });
+        continue;
+      }
+      const sheet = getGlassSheetRow(sheetId);
+      if (!sheet) { d.exec('ROLLBACK'); return { code: 'sheet_missing', color: item.sheet_color }; }
+      const pickedSheet = d
+        .prepare('SELECT COALESCE(SUM(sheets_count),0) AS n FROM stock_issues WHERE order_id = ? AND sheet_id = ?')
+        .get(orderRow.id, sheetId).n;
+      const remaining = item.required_sheets - pickedSheet;
+      if (count > remaining) {
+        problems.push({
+          kind: 'glass', color: item.sheet_color, sheetId, reason: 'over_remaining',
+          required: item.required_sheets, picked: pickedSheet,
+          remaining, requested: count,
+          message: `${item.sheet_color} 本次领取 ${count} 张，超过该单尚未领出的预留 ${remaining} 张`,
+        });
+      }
+      const netReserved = glassNetReservedInTx(sheetId);
+      if (sheet.stock < netReserved || sheet.stock < count) {
+        problems.push({
+          kind: 'glass', color: item.sheet_color, sheetId, reason: 'physical_shortage',
+          stock: sheet.stock, requested: count,
+          message: `${item.sheet_color} 实物库存仅 ${sheet.stock} 张，不足以发放本次 ${count} 张`,
+        });
+      }
+    }
+    if (problems.length) {
+      d.exec('ROLLBACK');
+      return { code: 'invalid_issue', problems };
+    }
+
+    // ---- 扣减实物库存 ----
+    if (p.leadBars > 0) {
+      const r = d.prepare('UPDATE lead_materials SET stock = stock - ?, updated_at = datetime(\'now\') WHERE id = ?')
+        .run(p.leadBars, planRow.material_id);
+      if (r.changes !== 1) throw new Error('铅条库存扣减失败');
+    }
+    for (const [sheetId, count] of glassDedup) {
+      const r = d.prepare('UPDATE glass_sheets SET stock = stock - ?, updated_at = datetime(\'now\') WHERE id = ?')
+        .run(count, sheetId);
+      if (r.changes !== 1) throw new Error('玻璃库存扣减失败');
+    }
+
+    // ---- 追加不可变领料行 ----
+    let firstId = null;
+    const ins = d.prepare(`INSERT INTO stock_issues
+      (issue_no, source_type, plan_id, order_id, combo_id, material_id, lead_bars,
+       sheet_id, sheet_color, sheets_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    if (p.leadBars > 0) {
+      const info = ins.run(p.issueNo, p.sourceType,
+        planRow ? planRow.id : null, orderRow ? orderRow.id : null, comboRow ? comboRow.id : null,
+        planRow.material_id, p.leadBars, null, null, 0);
+      firstId = info.lastInsertRowid;
+    }
+    for (const [sheetId, count] of glassDedup) {
+      const item = itemBySheet.get(sheetId);
+      const info = ins.run(p.issueNo, p.sourceType,
+        planRow ? planRow.id : null, orderRow.id, comboRow ? comboRow.id : null,
+        null, 0,
+        sheetId, item ? item.sheet_color : null, count);
+      if (firstId === null) firstId = info.lastInsertRowid;
+    }
+
+    d.exec('COMMIT');
+    return { code: 'ok', id: firstId, issueNo: p.issueNo };
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+// 事务内：某铅条规格的净预留（已确认预留 − 已领出）
+function leadNetReservedInTx(materialId) {
+  const d = getDb();
+  const gross = d
+    .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
+    .get(materialId).n;
+  return gross - leadPickedForMaterial(materialId);
+}
+
+// 事务内：某玻璃规格的净预留
+function glassNetReservedInTx(sheetId) {
+  const d = getDb();
+  const gross = d
+    .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
+              FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
+              WHERE ci.sheet_id = ? AND co.status = 'confirmed'`).get(sheetId).n;
+  return gross - glassPickedForSheet(sheetId);
+}
+
+// 某计划的领料汇总（本次/累计/余留在 HTTP 层基于此组装）
+function getPlanIssueStats(planId) {
+  const row = getPlanRow(planId);
+  if (!row) return null;
+  const picked = leadPickedForPlan(planId);
+  return {
+    requiredBars: row.required_bars,
+    pickedBars: picked,
+    remainingBars: row.required_bars - picked,
+  };
+}
+
+// 某裁片订单分色领料汇总
+function getOrderIssueStats(orderId) {
+  const row = getCutOrderRow(orderId);
+  if (!row) return null;
+  const items = getDb().prepare('SELECT * FROM cut_order_items WHERE order_id = ?').all(orderId);
+  const colors = items.map((it) => {
+    const picked = glassPickedForOrderSheet(orderId, it.sheet_id);
+    return {
+      sheetId: it.sheet_id,
+      color: it.sheet_color,
+      requiredSheets: it.required_sheets,
+      pickedSheets: picked,
+      remainingSheets: it.required_sheets - picked,
+    };
+  });
+  return {
+    totalRequired: colors.reduce((s, c) => s + c.requiredSheets, 0),
+    totalPicked: colors.reduce((s, c) => s + c.pickedSheets, 0),
+    totalRemaining: colors.reduce((s, c) => s + c.remainingSheets, 0),
+    colors,
+  };
+}
+
+// 整套单领料汇总（铅条取关联计划、玻璃取关联订单）
+function getComboIssueStats(comboId) {
+  const combo = getComboOrder(comboId);
+  if (!combo) return null;
+  return {
+    lead: getPlanIssueStats(combo.leadPlanId),
+    glass: getOrderIssueStats(combo.cutOrderId),
+  };
+}
+
 module.exports = {
   init, getDb,
   createDesign, getDesign, listDesigns,
   listPieces, getPiece, addPiece, updatePiece, deletePiece, replaceAllPieces,
   publishVersion, getPublication, getPublicationByVersion, getPublicationById, listPublications,
   listMaterials, getMaterial, getMaterialRow, getMaterialByName, createMaterial, updateMaterial,
-  createPlan, getPlan, listPlans, updatePlanDraft, confirmPlan, cancelPlan, deletePlan,
+  createPlan, getPlan, getPlanRow, listPlans, updatePlanDraft, confirmPlan, cancelPlan, deletePlan,
   listGlassSheets, glassSheetMapByColor, getGlassSheet, getGlassSheetRow, getGlassSheetByColorRow,
   createGlassSheet, updateGlassSheetStock,
-  createCutOrder, getCutOrder, listCutOrders, listCutOrderItems, updateCutOrderDraft,
+  createCutOrder, getCutOrder, getCutOrderRow, listCutOrders, listCutOrderItems, updateCutOrderDraft,
   confirmCutOrder, cancelCutOrder, deleteCutOrder,
   getReplacementByOldOrder, getReplacementByNewOrder, replaceCutOrder,
   createComboOrder, getComboOrder, listComboOrders, cancelComboOrder,
   createStocktake, updateStocktakeDraft, confirmStocktake, deleteStocktake,
   getStocktake, getStocktakeRow, listStocktakes, listStocktakeItemRows,
   leadReservedFor, glassReservedFor,
+  createStockIssue, getIssueRowsByNo, listIssueRows, listAllIssueRows,
+  leadPickedForMaterial, glassPickedForSheet, leadPickedForPlan, glassPickedForOrderSheet,
+  orderHasIssues, planHasIssues, getPlanIssueStats, getOrderIssueStats, getComboIssueStats,
 };

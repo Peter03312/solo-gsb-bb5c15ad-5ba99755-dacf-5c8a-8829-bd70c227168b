@@ -723,6 +723,13 @@ app.post('/api/plans/:planId/cancel', (req, res) => {
   if (r.code === 'draft_not_reserved') {
     return fail(res, 409, '草稿计划尚未预留库存，无需取消（可直接删除）');
   }
+  if (r.code === 'already_issued') {
+    return res.status(409).json({
+      ok: false, code: 'already_issued',
+      error: `该计划已有领料记录（已领 ${r.picked} 根），已领料单据不能取消`,
+      pickedBars: r.picked,
+    });
+  }
   if (r.code === 'already_canceled') {
     return res.status(409).json({ ok: false, error: '计划已取消，库存此前已释放，未重复变更', plan: serializePlan(db.getPlan(plan.id)) });
   }
@@ -752,6 +759,9 @@ function materialBrief(material) {
     length: material.length,
     stock: material.stock,
     reserved: material.reserved,
+    grossReserved: material.grossReserved,
+    picked: material.picked,
+    remainingReserved: material.remainingReserved,
     available: material.available,
   };
 }
@@ -764,6 +774,7 @@ function statusZh(status) {
 function serializePlan(plan) {
   const material = db.getMaterial(plan.materialId);
   const shortage = Math.max(0, plan.requiredBars - (material ? material.available : 0));
+  const issueStats = db.getPlanIssueStats(plan.id);
   return {
     id: plan.id,
     name: plan.name,
@@ -777,6 +788,9 @@ function serializePlan(plan) {
     requiredBars: plan.requiredBars,
     segmentCount: plan.segmentCount,
     layout: plan.layout,
+    pickedBars: issueStats.pickedBars,
+    remainingBars: issueStats.remainingBars,
+    issueCount: new Set(db.listIssueRows({ planId: plan.id }).map((r) => r.issue_no)).size,
     material: material
       ? materialBrief(material)
       : { id: plan.materialId, name: plan.materialName, length: plan.materialLength, unavailable: true },
@@ -1106,6 +1120,12 @@ app.post('/api/cut-orders/:orderId/cancel', (req, res) => {
   if (r.code === 'draft_not_reserved') {
     return fail(res, 409, '草稿订单尚未预留库存，无需取消（可直接删除）');
   }
+  if (r.code === 'already_issued') {
+    return res.status(409).json({
+      ok: false, code: 'already_issued',
+      error: '该裁片订单已有领料记录，已领料单据不能取消',
+    });
+  }
   if (r.code === 'already_canceled') {
     return res.status(409).json({
       ok: false, error: '订单已取消，库存此前已释放，未重复变更',
@@ -1280,6 +1300,13 @@ app.post('/api/cut-orders/:orderId/replacement/preview', (req, res) => {
     });
   }
   if (rejectIfNotConfirmed(res, order)) return;
+  if (db.orderHasIssues(order.id)) {
+    return res.status(409).json({
+      ok: false, code: 'already_issued',
+      error: '该裁片订单已有领料记录，已领料独立裁片订单不能换单',
+      order: serializeCutOrder(order),
+    });
+  }
   const inp = resolveReplaceInputs(req.body || {}, order);
   if (inp.error) {
     return res.status(inp.status || 400).json({
@@ -1351,6 +1378,13 @@ app.post('/api/cut-orders/:orderId/replacement', (req, res) => {
     }
     return fail(res, 409, '仅已确认订单可以换单；草稿请直接修改或删除后重建');
   }
+  if (order.issueCount > 0 || db.orderHasIssues(order.id)) {
+    return res.status(409).json({
+      ok: false, code: 'already_issued',
+      error: `该裁片订单已有 ${order.issueCount} 次领料记录，已领料独立裁片订单不能换单`,
+      order: serializeCutOrder(order),
+    });
+  }
 
   const inp = resolveReplaceInputs(body, order);
   if (inp.error) {
@@ -1403,6 +1437,13 @@ app.post('/api/cut-orders/:orderId/replacement', (req, res) => {
   }
   if (r.code === 'order_canceled') return fail(res, 409, '旧单已取消，不能换单');
   if (r.code === 'order_not_confirmed') return fail(res, 409, '仅已确认订单可以换单');
+  if (r.code === 'already_issued') {
+    return res.status(409).json({
+      ok: false, code: 'already_issued',
+      error: '该裁片订单已有领料记录，已领料独立裁片订单不能换单',
+      order: serializeCutOrder(db.getCutOrder(order.id)),
+    });
+  }
   if (r.code === 'sheet_missing') return fail(res, 409, `颜色 ${r.color} 的原片规格已不存在，无法换单`);
   if (r.code === 'sheet_changed') {
     return fail(res, 409, `颜色 ${r.color} 的原片规格已变化，请刷新后重试`);
@@ -1679,6 +1720,13 @@ app.post('/api/combo-orders/:comboId/cancel', (req, res) => {
       combo: serializeCombo(db.getComboOrder(combo.id)),
     });
   }
+  if (r.code === 'already_issued') {
+    return res.status(409).json({
+      ok: false, code: 'already_issued',
+      error: '该整套单已有领料记录，已领料单据不能取消',
+      combo: serializeCombo(db.getComboOrder(combo.id)),
+    });
+  }
   res.json({ ok: true, combo: serializeCombo(r.combo) });
 });
 
@@ -1686,6 +1734,8 @@ app.post('/api/combo-orders/:comboId/cancel', (req, res) => {
 function serializeCombo(combo) {
   const plan = db.getPlan(combo.leadPlanId);
   const order = db.getCutOrder(combo.cutOrderId);
+  const leadStats = db.getPlanIssueStats(combo.leadPlanId);
+  const glassStats = db.getOrderIssueStats(combo.cutOrderId);
   return {
     id: combo.id,
     name: combo.name,
@@ -1702,6 +1752,11 @@ function serializeCombo(combo) {
     totalSheets: combo.totalSheets,
     leadPlanId: combo.leadPlanId,
     cutOrderId: combo.cutOrderId,
+    pickedBars: leadStats ? leadStats.pickedBars : 0,
+    remainingBars: leadStats ? leadStats.remainingBars : combo.requiredBars,
+    pickedSheets: glassStats ? glassStats.totalPicked : 0,
+    remainingSheets: glassStats ? glassStats.totalRemaining : combo.totalSheets,
+    issueCount: new Set(db.listIssueRows({ comboId: combo.id }).map((r) => r.issue_no)).size,
     snapshotBound: true,
     leadPlan: plan ? serializePlan(plan) : null,
     cutOrder: order ? serializeCutOrder(order) : null,
@@ -1715,9 +1770,18 @@ function serializeCombo(combo) {
 function serializeCutOrder(order) {
   const specs = sheetSpecMap();
   const colors = colorSummaries(order.layout, specs);
+  // 该单分色的已领/余留预留（领料后不影响其他单据可用量）
+  const stats = db.getOrderIssueStats(order.id);
+  const pickedBySheet = new Map(stats.colors.map((c) => [c.sheetId, c]));
+  for (const c of colors) {
+    const st = pickedBySheet.get(c.sheetId);
+    c.pickedSheets = st ? st.pickedSheets : 0;
+    c.remainingSheets = st ? st.remainingSheets : c.requiredSheets;
+  }
   const totalShortage = order.status === 'draft'
     ? colors.reduce((s, c) => s + c.shortage, 0)
     : 0;
+  const totalPicked = stats.totalPicked;
   // 换单关系（若有）：replacedBy=旧单被哪张新单替换；replaces=新单接替了哪张旧单
   let replacedBy = null;
   let replaces = null;
@@ -1756,6 +1820,9 @@ function serializeCutOrder(order) {
     layout: order.layout,
     colors,
     items: db.listCutOrderItems(order.id),
+    pickedSheets: totalPicked,
+    remainingSheets: stats.totalRemaining,
+    issueCount: new Set(db.listIssueRows({ orderId: order.id }).map((r) => r.issue_no)).size,
     totalShortage,
     feasible: order.status !== 'draft' || totalShortage === 0,
     snapshotBound: true,
@@ -2007,6 +2074,460 @@ app.delete('/api/stocktakes/:id', (req, res) => {
     return fail(res, 409, '已确认盘点单为永久记录，不能删除（仅可查阅）');
   }
   res.json({ ok: true });
+});
+
+// ---------- 领料（按已确认独立计划 / 独立裁片订单 / 整套单分次领料） ----------
+
+const ISSUE_NO_MAX = 80;
+const ISSUE_NO_RE = /^[A-Za-z0-9._:-一-龥]{1,80}$/;
+
+// 解析领料请求：
+//   { issueNo, sourceType:'lead_plan'|'cut_order'|'combo'（或 planId/orderId/comboId 显式指定）,
+//     leadBars?, sheets? 或 glass?: [{sheetId|color, count}] }
+// 数量均为非负整数且至少一项大于零；返回 { error,status,code } 或结构化入参。
+function parseIssueBody(body) {
+  const b = body || {};
+  const issueNo = typeof b.issueNo === 'string' ? b.issueNo.trim() : '';
+  if (!ISSUE_NO_RE.test(issueNo)) {
+    return { error: 'issueNo（唯一领料号）必填：1–80 个字母/数字/汉字/._:-，重复提交请复用同一值', code: 'invalid_issue_no' };
+  }
+
+  let sourceType = b.sourceType === 'lead_plan' || b.sourceType === 'cut_order' || b.sourceType === 'combo'
+    ? b.sourceType
+    : null;
+  if (!sourceType) {
+    if (b.planId !== undefined) sourceType = 'lead_plan';
+    else if (b.comboId !== undefined) sourceType = 'combo';
+    else if (b.orderId !== undefined) sourceType = 'cut_order';
+  }
+  let planId = null;
+  let orderId = null;
+  let comboId = null;
+  if (!sourceType) {
+    return { error: '必须指定领料来源：sourceType 为 lead_plan / cut_order / combo（或提供 planId/orderId/comboId）' };
+  }
+  if (sourceType === 'lead_plan') planId = Number(b.planId ?? b.sourceId);
+  if (sourceType === 'cut_order') orderId = Number(b.orderId ?? b.sourceId);
+  if (sourceType === 'combo') comboId = Number(b.comboId ?? b.sourceId);
+  if (sourceType === 'lead_plan' && (!Number.isInteger(planId) || planId <= 0)) {
+    return { error: 'planId 必须是铅条生产计划的正整数 id' };
+  }
+  if (sourceType === 'cut_order' && (!Number.isInteger(orderId) || orderId <= 0)) {
+    return { error: 'orderId 必须是裁片订单的正整数 id' };
+  }
+  if (sourceType === 'combo' && (!Number.isInteger(comboId) || comboId <= 0)) {
+    return { error: 'comboId 必须是整套用料单的正整数 id' };
+  }
+
+  // 铅条根数
+  let leadBars = 0;
+  if (b.leadBars !== undefined) {
+    const n = Number(b.leadBars);
+    if (!Number.isInteger(n) || n < 0) return { error: '本次铅条根数 leadBars 必须是非负整数' };
+    leadBars = n;
+  }
+
+  // 玻璃：接受 sheets 或 glass，元素为 {sheetId,count} 或 {color,count}
+  const rawGlass = b.sheets !== undefined ? b.sheets : b.glass;
+  const glass = [];
+  if (rawGlass !== undefined) {
+    if (!Array.isArray(rawGlass)) return { error: 'sheets 必须是 [{sheetId 或 color, count}] 数组' };
+    for (const g of rawGlass) {
+      if (!g || typeof g !== 'object') return { error: '每个玻璃领料项必须是对象 {sheetId 或 color, count}' };
+      const count = Number(g.count);
+      if (!Number.isInteger(count) || count < 0) return { error: '各色领取张数必须是非负整数' };
+      let sheetId = null;
+      let color = null;
+      if (g.sheetId !== undefined) {
+        sheetId = Number(g.sheetId);
+        if (!Number.isInteger(sheetId) || sheetId <= 0) return { error: 'sheetId 必须是玻璃原片规格的正整数 id' };
+      } else if (typeof g.color === 'string' && g.color.trim()) {
+        color = g.color.trim().toLowerCase();
+        if (!COLOR_RE.test(color)) return { error: '颜色必须是 #RRGGBB 形式' };
+        const row = db.getGlassSheetByColorRow(color);
+        if (!row) return { error: `颜色 ${color} 的原片规格不存在`, status: 404, code: 'sheet_not_found', color };
+        sheetId = row.id;
+      } else {
+        return { error: '每个玻璃领料项必须提供 sheetId 或 color' };
+      }
+      if (count > 0) glass.push({ sheetId, count });
+    }
+  }
+
+  // 同 sheetId 合并
+  const merged = new Map();
+  for (const g of glass) merged.set(g.sheetId, (merged.get(g.sheetId) || 0) + g.count);
+  const glassItems = [...merged].map(([sheetId, count]) => ({ sheetId, count }));
+
+  if (leadBars === 0 && glassItems.length === 0) {
+    return { error: '本次铅条根数与各色原片张数均为 0：至少一项必须大于 0' };
+  }
+  return { params: { issueNo, sourceType, planId, orderId, comboId, leadBars, glass: glassItems } };
+}
+
+// 组装某次领料后的单据维度汇总（本次 / 累计 / 余留 + 当前实物库存）
+function buildIssueResult(p, issueRows) {
+  const bySheet = new Map();
+  let thisLead = 0;
+  for (const r of issueRows) {
+    thisLead += r.lead_bars;
+    if (r.sheet_id !== null) {
+      bySheet.set(r.sheet_id, (bySheet.get(r.sheet_id) || 0) + r.sheets_count);
+    }
+  }
+  // 组合单按行回填关联计划/订单（便捷入口入参只有 comboId）
+  const planId = p.planId || issueRows.find((r) => r.plan_id !== null)?.plan_id || null;
+  const orderId = p.orderId || issueRows.find((r) => r.order_id !== null)?.order_id || null;
+
+  const result = {
+    issueNo: p.issueNo,
+    sourceType: p.sourceType,
+    planId,
+    orderId,
+    comboId: p.comboId,
+    issuedAt: issueRows[0] ? issueRows[0].created_at : null,
+    thisTime: { leadBars: thisLead, glass: [] },
+    lead: null,
+    glass: { colors: [] },
+  };
+
+  // 铅条维度
+  if (planId) {
+    const stats = db.getPlanIssueStats(planId);
+    const planRow = db.getPlanRow(planId);
+    const mat = db.getMaterial(planRow.material_id);
+    result.lead = {
+      materialId: planRow.material_id,
+      materialName: mat ? mat.name : planRow.material_name,
+      requiredBars: stats.requiredBars,
+      thisBars: thisLead,
+      pickedBars: stats.pickedBars,
+      remainingBars: stats.remainingBars,
+      stockBars: mat ? mat.stock : null,
+    };
+  }
+
+  // 玻璃维度
+  if (orderId) {
+    const stats = db.getOrderIssueStats(orderId);
+    for (const c of stats.colors) {
+      const thisCount = bySheet.get(c.sheetId) || 0;
+      if (thisCount > 0) {
+        result.thisTime.glass.push({
+          sheetId: c.sheetId, color: c.color,
+          count: thisCount,
+        });
+      }
+      const sheet = db.getGlassSheet(c.sheetId);
+      result.glass.colors.push({
+        sheetId: c.sheetId,
+        color: c.color,
+        requiredSheets: c.requiredSheets,
+        thisSheets: thisCount,
+        pickedSheets: c.pickedSheets,
+        remainingSheets: c.remainingSheets,
+        stockSheets: sheet ? sheet.stock : null,
+      });
+    }
+    result.glass.totalThis = result.thisTime.glass.reduce((s, g) => s + g.count, 0);
+    result.glass.totalPicked = stats.totalPicked;
+    result.glass.totalRemaining = stats.totalRemaining;
+  }
+  return result;
+}
+
+// 把同领料号的若干行按单据归属折叠为一条历史记录（整组行来自同一次领料）
+function serializeIssueGroup(rows) {
+  const first = rows[0];
+  const leadBars = rows.reduce((s, r) => s + r.lead_bars, 0);
+  const glassMap = new Map();
+  for (const r of rows) {
+    if (r.sheet_id !== null) {
+      if (!glassMap.has(r.sheet_id)) glassMap.set(r.sheet_id, { sheetId: r.sheet_id, color: r.sheet_color, count: 0 });
+      glassMap.get(r.sheet_id).count += r.sheets_count;
+    }
+  }
+  return {
+    issueNo: first.issue_no,
+    sourceType: first.source_type,
+    planId: first.plan_id,
+    orderId: first.order_id,
+    comboId: first.combo_id,
+    leadBars,
+    glass: [...glassMap.values()],
+    totalGlass: [...glassMap.values()].reduce((s, g) => s + g.count, 0),
+    issuedAt: first.created_at,
+  };
+}
+
+function allIssueGroups() {
+  const groups = new Map();
+  for (const r of db.listAllIssueRows()) {
+    if (!groups.has(r.issue_no)) groups.set(r.issue_no, []);
+    groups.get(r.issue_no).push(r);
+  }
+  return [...groups.values()].map(serializeIssueGroup);
+}
+
+function issueGroupsFor({ planId, orderId, comboId }) {
+  const groups = new Map();
+  for (const r of db.listIssueRows({ planId, orderId, comboId })) {
+    if (!groups.has(r.issue_no)) groups.set(r.issue_no, []);
+    groups.get(r.issue_no).push(r);
+  }
+  return [...groups.values()].map(serializeIssueGroup);
+}
+
+// POST /api/issues —— 领料确认（同事务扣减实物库存与预留，记录不可变）
+function handleIssueCreate(req, res) {
+  const parsed = parseIssueBody(req.body || {});
+  if (parsed.error) {
+    return res.status(parsed.status || 400).json({
+      ok: false, error: parsed.error,
+      code: parsed.code || (parsed.status === 404 ? 'sheet_not_found' : 'invalid_issue'),
+      color: parsed.color,
+    });
+  }
+  const p = parsed.params;
+
+  // 快速前置校验（事务内仍会重核）
+  if (p.sourceType === 'lead_plan') {
+    const plan = db.getPlan(p.planId);
+    if (!plan) return fail(res, 404, '铅条生产计划不存在');
+    if (plan.comboId) {
+      return res.status(409).json({
+        ok: false, code: 'issue_use_combo', comboId: plan.comboId,
+        error: `该计划属于整套用料单 #${plan.comboId}，请到整套单入口领料（POST /api/combo-orders/${plan.comboId}/issues）`,
+      });
+    }
+    if (plan.status !== 'confirmed') {
+      return res.status(409).json({
+        ok: false, code: 'source_not_confirmed', status: plan.status,
+        error: `仅已确认的铅条计划可以领料（当前为 ${plan.statusText}）`,
+      });
+    }
+  } else if (p.sourceType === 'cut_order') {
+    const order = db.getCutOrder(p.orderId);
+    if (!order) return fail(res, 404, '裁片订单不存在');
+    if (order.comboId) {
+      return res.status(409).json({
+        ok: false, code: 'issue_use_combo', comboId: order.comboId,
+        error: `该裁片订单属于整套用料单 #${order.comboId}，请到整套单入口领料（POST /api/combo-orders/${order.comboId}/issues）`,
+      });
+    }
+    if (order.status !== 'confirmed') {
+      return res.status(409).json({
+        ok: false, code: 'source_not_confirmed', status: order.status,
+        error: `仅已确认的裁片订单可以领料（当前为 ${order.statusText}）`,
+      });
+    }
+  } else {
+    const combo = db.getComboOrder(p.comboId);
+    if (!combo) return fail(res, 404, '整套用料单不存在');
+    if (combo.status !== 'confirmed') {
+      return res.status(409).json({
+        ok: false, code: 'source_not_confirmed', status: combo.status,
+        error: `仅已确认的整套用料单可以领料（当前为 ${comboStatusZh(combo.status)}）`,
+      });
+    }
+  }
+
+  const r = db.createStockIssue({
+    issueNo: p.issueNo,
+    sourceType: p.sourceType,
+    planId: p.planId,
+    orderId: p.orderId,
+    comboId: p.comboId,
+    leadBars: p.leadBars,
+    glass: p.glass,
+  });
+
+  if (r.code === 'idempotent') {
+    const rows = db.getIssueRowsByNo(p.issueNo);
+    const content = issueContentParamsFromRows(rows);
+    return res.json({
+      ok: true, idempotent: true,
+      message: '该领料号已提交过且内容一致：返回原领料记录，未再次扣减库存',
+      issue: buildIssueResult(content, rows),
+    });
+  }
+  if (r.code === 'issue_no_conflict') {
+    return res.status(409).json({
+      ok: false, code: 'issue_no_conflict', issueNo: p.issueNo,
+      error: '同一领料号已用于内容不同的领料；请核对后使用新的领料号（本次未生效）',
+      existing: describeIssueContent(r.existing),
+    });
+  }
+  if (r.code === 'not_found') return fail(res, 404, '领料来源单据不存在');
+  if (r.code === 'issue_use_combo') {
+    return res.status(409).json({
+      ok: false, code: 'issue_use_combo', comboId: r.comboId,
+      error: `该单属于整套用料单 #${r.comboId}，请到整套单入口领料`,
+    });
+  }
+  if (r.code === 'source_not_confirmed') {
+    return res.status(409).json({ ok: false, code: 'source_not_confirmed', status: r.status,
+      error: '仅已确认的单据可以领料' });
+  }
+  if (r.code === 'combo_links_broken') return fail(res, 409, '整套单关联的计划/订单状态异常，不能领料');
+  if (r.code === 'material_missing') return fail(res, 409, '铅条原材规格已不存在，不能领料');
+  if (r.code === 'sheet_missing') return fail(res, 409, `颜色 ${r.color} 的原片规格已不存在，不能领料`);
+  if (r.code === 'invalid_issue') {
+    return res.status(409).json({
+      ok: false, code: 'invalid_issue',
+      error: '领料数量不合法：超过该单剩余预留或实物库存不足，整次未生效（库存未扣减）',
+      problems: r.problems,
+    });
+  }
+
+  const rows = db.getIssueRowsByNo(p.issueNo);
+  res.status(201).json({ ok: true, idempotent: false, issue: buildIssueResult(p, rows) });
+}
+
+// 从历史行反推 buildIssueResult 所需的“参数形态”
+function issueContentParamsFromRows(rows) {
+  const first = rows[0];
+  const glass = [];
+  const seen = new Set();
+  for (const r of rows) {
+    if (r.sheet_id !== null && !seen.has(r.sheet_id)) {
+      seen.add(r.sheet_id);
+      glass.push({ sheetId: r.sheet_id });
+    }
+  }
+  return {
+    issueNo: first.issue_no,
+    sourceType: first.source_type,
+    planId: first.plan_id,
+    orderId: first.order_id,
+    comboId: first.combo_id,
+  };
+}
+
+function describeIssueContent(c) {
+  return {
+    sourceType: c.sourceType,
+    planId: c.planId,
+    orderId: c.orderId,
+    comboId: c.comboId,
+    leadBars: c.leadBars,
+    glass: [...c.glass.entries()].map(([sheetId, count]) => ({ sheetId, count })),
+  };
+}
+
+app.post('/api/issues', handleIssueCreate);
+
+// 按单据维度的便捷领料入口（等价于 POST /api/issues 并自动带来源类型与单据 id）
+app.post('/api/plans/:planId/issues', (req, res) => {
+  handleIssueCreate(
+    { ...req, body: { ...(req.body || {}), sourceType: 'lead_plan', planId: Number(req.params.planId) } },
+    res,
+  );
+});
+app.post('/api/cut-orders/:orderId/issues', (req, res) => {
+  handleIssueCreate(
+    { ...req, body: { ...(req.body || {}), sourceType: 'cut_order', orderId: Number(req.params.orderId) } },
+    res,
+  );
+});
+app.post('/api/combo-orders/:comboId/issues', (req, res) => {
+  handleIssueCreate(
+    { ...req, body: { ...(req.body || {}), sourceType: 'combo', comboId: Number(req.params.comboId) } },
+    res,
+  );
+});
+
+// 领料历史（全部），可按 source 过滤：?source=lead_plan|cut_order|combo
+app.get('/api/issues', (req, res) => {
+  let groups = allIssueGroups();
+  const source = req.query.source;
+  if (source) {
+    if (!['lead_plan', 'cut_order', 'combo'].includes(source)) {
+      return fail(res, 400, 'source 必须是 lead_plan / cut_order / combo');
+    }
+    groups = groups.filter((g) => g.sourceType === source);
+  }
+  res.json({ ok: true, issues: groups });
+});
+
+app.get('/api/issues/:issueNo', (req, res) => {
+  const issueNo = decodeURIComponent(req.params.issueNo);
+  const rows = db.getIssueRowsByNo(issueNo);
+  if (!rows.length) return fail(res, 404, '领料号不存在');
+  const content = issueContentParamsFromRows(rows);
+  res.json({ ok: true, issue: buildIssueResult(content, rows) });
+});
+
+// 计划维度：剩余预留 + 领料历史
+app.get('/api/plans/:planId/issues', (req, res) => {
+  const plan = db.getPlan(Number(req.params.planId));
+  if (!plan) return fail(res, 404, '生产计划不存在');
+  const stats = db.getPlanIssueStats(plan.id);
+  const mat = db.getMaterial(plan.materialId);
+  res.json({
+    ok: true,
+    lead: {
+      materialId: plan.materialId,
+      materialName: mat ? mat.name : plan.materialName,
+      requiredBars: stats.requiredBars,
+      pickedBars: stats.pickedBars,
+      remainingBars: stats.remainingBars,
+      stockBars: mat ? mat.stock : null,
+    },
+    issues: issueGroupsFor({ planId: plan.id }),
+  });
+});
+
+// 订单维度：分色剩余预留 + 领料历史
+app.get('/api/cut-orders/:orderId/issues', (req, res) => {
+  const order = db.getCutOrder(Number(req.params.orderId));
+  if (!order) return fail(res, 404, '裁片订单不存在');
+  const stats = db.getOrderIssueStats(order.id);
+  const colors = stats.colors.map((c) => {
+    const sheet = db.getGlassSheet(c.sheetId);
+    return { ...c, stockSheets: sheet ? sheet.stock : null };
+  });
+  res.json({
+    ok: true,
+    glass: {
+      totalRequired: stats.totalRequired,
+      totalPicked: stats.totalPicked,
+      totalRemaining: stats.totalRemaining,
+      colors,
+    },
+    issues: issueGroupsFor({ orderId: order.id }),
+  });
+});
+
+// 整套单维度：铅条（关联计划）+ 玻璃（关联订单）剩余预留与领料历史
+app.get('/api/combo-orders/:comboId/issues', (req, res) => {
+  const combo = db.getComboOrder(Number(req.params.comboId));
+  if (!combo) return fail(res, 404, '整套用料单不存在');
+  const plan = db.getPlan(combo.leadPlanId);
+  const leadStats = db.getPlanIssueStats(combo.leadPlanId);
+  const glassStats = db.getOrderIssueStats(combo.cutOrderId);
+  const mat = plan ? db.getMaterial(plan.materialId) : null;
+  res.json({
+    ok: true,
+    lead: {
+      materialId: plan ? plan.materialId : null,
+      materialName: mat ? mat.name : (plan ? plan.materialName : null),
+      requiredBars: leadStats.requiredBars,
+      pickedBars: leadStats.pickedBars,
+      remainingBars: leadStats.remainingBars,
+      stockBars: mat ? mat.stock : null,
+    },
+    glass: {
+      totalRequired: glassStats.totalRequired,
+      totalPicked: glassStats.totalPicked,
+      totalRemaining: glassStats.totalRemaining,
+      colors: glassStats.colors.map((c) => {
+        const sheet = db.getGlassSheet(c.sheetId);
+        return { ...c, stockSheets: sheet ? sheet.stock : null };
+      }),
+    },
+    issues: issueGroupsFor({ comboId: combo.id }),
+  });
 });
 
 // 前端单页

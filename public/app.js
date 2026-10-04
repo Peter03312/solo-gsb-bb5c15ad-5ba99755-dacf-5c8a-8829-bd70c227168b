@@ -713,6 +713,7 @@ function switchTab(which) {
   document.getElementById('tabCutting').classList.toggle('active', which === 'cutting');
   document.getElementById('tabCombo').classList.toggle('active', which === 'combo');
   document.getElementById('tabStocktake').classList.toggle('active', which === 'stocktake');
+  document.getElementById('tabIssue').classList.toggle('active', which === 'issue');
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
   document.getElementById('viewDiff').hidden = which !== 'diff';
@@ -721,6 +722,7 @@ function switchTab(which) {
   document.getElementById('viewCutting').hidden = which !== 'cutting';
   document.getElementById('viewCombo').hidden = which !== 'combo';
   document.getElementById('viewStocktake').hidden = which !== 'stocktake';
+  document.getElementById('viewIssue').hidden = which !== 'issue';
   if (which === 'published') loadPubVersions();
   if (which === 'diff') enterDiff();
   if (which === 'print') enterPrint();
@@ -728,6 +730,7 @@ function switchTab(which) {
   if (which === 'cutting') enterCutting();
   if (which === 'combo') enterCombo();
   if (which === 'stocktake') enterStocktake();
+  if (which === 'issue') enterIssue();
 }
 
 (async function init() {
@@ -1008,12 +1011,13 @@ function renderMaterials() {
     el.innerHTML = '<div class="hint">尚未登记原材。</div>';
     return;
   }
-  let html = '<table><thead><tr><th>规格</th><th class="num">定尺</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>规格</th><th class="num">定尺</th><th class="num">库存</th><th class="num">已领</th><th class="num">未领预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
   for (const m of prod.materials) {
     html += `<tr>
       <td>${escapeHtml(m.name)}</td>
       <td class="num">${fmt(m.length)}</td>
       <td class="num">${m.stock}</td>
+      <td class="num">${m.picked || 0}</td>
       <td class="num">${m.reserved}</td>
       <td class="num"><b>${m.available}</b></td>
       <td><input type="number" min="0" step="1" value="${m.stock}" class="stock-edit" data-id="${m.id}" style="width:72px"></td>
@@ -1337,8 +1341,11 @@ function renderPlanList() {
       ? ` <span class="gap-info">缺 ${p.shortage} 根</span>` : '';
     const comboTag = p.comboId
       ? ` <span class="muted small">🔗 整套 #${p.comboId}</span>` : '';
+    const issueTag = p.status === 'confirmed' && p.pickedBars > 0
+      ? ` <span class="badge" style="background:#fff4e0;color:#b26a00">已领 ${p.pickedBars}/${p.requiredBars} · 余 ${p.remainingBars}</span>`
+      : '';
     return `<div class="plan-item${prod.detailPlan === p.id ? ' active' : ''}" data-id="${p.id}">
-      <div>${badge} <b>#${p.id}</b> ${escapeHtml(p.name)}${warn}${comboTag}</div>
+      <div>${badge} <b>#${p.id}</b> ${escapeHtml(p.name)}${warn}${comboTag}${issueTag}</div>
       <div class="muted small">v${p.version} · ${p.copies}件 · 用 ${p.requiredBars} 根 ·
         ${escapeHtml(p.material ? p.material.name : '规格已删')}</div>
     </div>`;
@@ -1691,12 +1698,13 @@ function renderGlassList() {
     el.innerHTML = '<div class="hint">尚未登记颜色原片。每种颜色仅可登记一种宽×高规格。</div>';
     return;
   }
-  let html = '<table><thead><tr><th>颜色</th><th class="num">宽×高</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>颜色</th><th class="num">宽×高</th><th class="num">库存</th><th class="num">已领</th><th class="num">未领预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
   for (const s of cut.sheets) {
     html += `<tr>
       <td><span class="color-chip" style="background:${s.color}"></span>${s.color}</td>
       <td class="num">${s.width}×${s.height}</td>
       <td class="num">${s.stock}</td>
+      <td class="num">${s.picked || 0}</td>
       <td class="num">${s.reserved}</td>
       <td class="num"><b>${s.available}</b></td>
       <td><input type="number" min="0" step="1" value="${s.stock}" class="glass-stock" data-id="${s.id}" style="width:72px"></td>
@@ -2165,9 +2173,12 @@ function renderCutOrderList() {
       ? ` <span class="muted small">⇄ 由 #${o.replacedBy?.newOrderId || '?'} 接替</span>`
       : o.replaces ? ` <span class="muted small">⇄ 接替 #${o.replaces.oldOrderId}</span>` : '';
     const comboTag = o.comboId ? ` <span class="muted small">🔗 整套 #${o.comboId}</span>` : '';
+    const issueTag = o.status === 'confirmed' && o.pickedSheets > 0
+      ? ` <span class="badge" style="background:#fff4e0;color:#b26a00">已领 ${o.pickedSheets}/${o.totalSheets} · 余 ${o.remainingSheets}</span>`
+      : '';
     return `<div class="plan-item${cut.detailId === o.id ? ' active' : ''}" data-id="${o.id}">
       <div>${badge} <b>#${o.id}</b> ${escapeHtml(o.name)}${warn}</div>
-      <div class="muted small">v${o.version} · ${o.copies}件 · 间距 ${o.gap}mm · ${o.totalSheets} 张 ${colors}${rel}${comboTag}</div>
+      <div class="muted small">v${o.version} · ${o.copies}件 · 间距 ${o.gap}mm · ${o.totalSheets} 张 ${colors}${rel}${comboTag}${issueTag}</div>
     </div>`;
   }).join('');
   el.querySelectorAll('.plan-item').forEach((div) => {
@@ -2406,8 +2417,11 @@ function renderComboList() {
     const badge = c.status === 'confirmed'
       ? '<span class="badge ok">已确认</span>'
       : '<span class="badge" style="background:#eee;color:#888">已取消</span>';
+    const issueTag = c.status === 'confirmed' && c.issueCount > 0
+      ? ` <span class="badge" style="background:#fff4e0;color:#b26a00">已领 ${c.issueCount} 次 · 铅余 ${c.remainingBars}/玻余 ${c.remainingSheets}</span>`
+      : '';
     return `<div class="plan-item${combo.detailId === c.id ? ' active' : ''}" data-id="${c.id}">
-      <div>${badge} <b>#${c.id}</b> ${escapeHtml(c.name)}</div>
+      <div>${badge} <b>#${c.id}</b> ${escapeHtml(c.name)}${issueTag}</div>
       <div class="muted small">v${c.version} · ${c.copies}件 · 铅条 ${c.requiredBars} 根 · 玻璃 ${c.totalSheets} 张
         · 计划 #${c.leadPlanId} / 订单 #${c.cutOrderId}</div>
     </div>`;
@@ -2750,3 +2764,225 @@ function stRenderDetail(s) {
 
 document.getElementById('tabStocktake').addEventListener('click', () => switchTab('stocktake'));
 document.getElementById('btnStPreview').addEventListener('click', () => previewStocktake(null));
+
+// ================= 领料（独立计划 / 独立裁片订单 / 整套单 分次领料） =================
+
+const issue = {
+  sourceType: 'lead_plan',
+  sources: [], // 当前类型可选单据
+  current: null, // 选中的单据详情（含剩余预留）
+  selectedId: null,
+};
+
+function issueBanner(kind, msg) {
+  const b = document.getElementById('issueBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.innerHTML = msg;
+  clearTimeout(issueBanner._t);
+  if (kind === 'success') issueBanner._t = setTimeout(() => { b.hidden = true; }, 4000);
+}
+
+function genIssueNo() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  return `LL-${stamp}-${Math.random().toString(36).slice(2, 6)}`.toUpperCase();
+}
+
+async function enterIssue() {
+  issueBanner(false);
+  document.getElementById('issueNo').value = genIssueNo();
+  await issueLoadSources();
+  await issueLoadHistory();
+}
+
+async function issueLoadSources() {
+  issue.sourceType = document.getElementById('issueSourceType').value;
+  let url;
+  if (issue.sourceType === 'lead_plan') url = '/api/plans';
+  else if (issue.sourceType === 'cut_order') url = '/api/cut-orders';
+  else url = '/api/combo-orders';
+  const data = await api('GET', url);
+  const key = issue.sourceType === 'lead_plan' ? 'plans'
+    : issue.sourceType === 'cut_order' ? 'orders' : 'combos';
+  issue.sources = data[key].filter((x) => x.status === 'confirmed');
+  const sel = document.getElementById('issueSourceSelect');
+  if (!issue.sources.length) {
+    sel.innerHTML = '<option value="">（暂无已确认单据）</option>';
+  } else {
+    sel.innerHTML = issue.sources.map((x) => {
+      let label;
+      if (issue.sourceType === 'lead_plan') {
+        label = `#${x.id} ${x.name}（v${x.version} · 需 ${x.requiredBars} 根 · 余 ${x.remainingBars}）`;
+      } else if (issue.sourceType === 'cut_order') {
+        label = `#${x.id} ${x.name}（v${x.version} · 需 ${x.totalSheets} 张 · 余 ${x.remainingSheets}）`;
+      } else {
+        label = `#${x.id} ${x.name}（v${x.version} · 铅条余 ${x.remainingBars} / 玻璃余 ${x.remainingSheets}）`;
+      }
+      return `<option value="${x.id}">${escapeHtml(label)}</option>`;
+    }).join('');
+  }
+  await issueSelectSource();
+}
+
+async function issueSelectSource() {
+  issue.selectedId = Number(document.getElementById('issueSourceSelect').value) || null;
+  const leadBox = document.getElementById('issueLeadBox');
+  const glassBox = document.getElementById('issueGlassBox');
+  if (!issue.selectedId) {
+    leadBox.hidden = true;
+    glassBox.hidden = true;
+    document.getElementById('issueDetail').innerHTML = '<div class="hint">没有已确认单据可选。</div>';
+    return;
+  }
+  leadBox.hidden = issue.sourceType === 'cut_order';
+  glassBox.hidden = issue.sourceType === 'lead_plan';
+
+  let detailUrl, statsUrl;
+  if (issue.sourceType === 'lead_plan') {
+    detailUrl = `/api/plans/${issue.selectedId}/issues`;
+  } else if (issue.sourceType === 'cut_order') {
+    detailUrl = `/api/cut-orders/${issue.selectedId}/issues`;
+  } else {
+    detailUrl = `/api/combo-orders/${issue.selectedId}/issues`;
+  }
+  void statsUrl;
+  const data = await api('GET', detailUrl);
+  issue.current = data;
+  issueRenderInputs(data);
+  issueRenderDetail(data);
+}
+
+function issueRenderInputs(d) {
+  const leadInput = document.getElementById('issueLeadBars');
+  if (d.lead) {
+    leadInput.max = d.lead.remainingBars;
+    leadInput.value = 0;
+  }
+  const box = document.getElementById('issueGlassInputs');
+  if (!d.glass || !d.glass.colors || !d.glass.colors.length) { box.innerHTML = ''; return; }
+  box.innerHTML = '<table><tbody>' + d.glass.colors.map((c) => `
+    <tr>
+      <td><span class="color-chip" style="background:${c.color}"></span>${c.color}</td>
+      <td class="num muted small">预留 ${c.requiredSheets} · 已领 ${c.pickedSheets} · <b>余 ${c.remainingSheets}</b></td>
+      <td><input type="number" min="0" max="${c.remainingSheets}" step="1" value="0"
+            data-issue-sheet="${c.sheetId}" data-issue-color="${c.color}" style="width:80px"></td>
+    </tr>`).join('') + '</tbody></table>';
+}
+
+function issueRenderDetail(d) {
+  const el = document.getElementById('issueDetail');
+  let html = '';
+  if (d.lead) {
+    html += `<h3>铅条</h3>
+      <div class="stock-badge ${d.lead.remainingBars > 0 ? 'ok' : ''}">
+        ${escapeHtml(d.lead.materialName || '')}：预留 <b>${d.lead.requiredBars}</b> 根 ·
+        已领 <b>${d.lead.pickedBars}</b> · 尚未领出 <b>${d.lead.remainingBars}</b> ·
+        实物库存 ${d.lead.stockBars === null ? '—' : d.lead.stockBars} 根
+      </div>`;
+  }
+  if (d.glass && d.glass.colors && d.glass.colors.length) {
+    html += `<h3>玻璃原片（预留 ${d.glass.totalRequired} · 已领 ${d.glass.totalPicked} · 余 ${d.glass.totalRemaining} 张）</h3>
+      <table><thead><tr><th>颜色</th><th class="num">预留</th><th class="num">已领</th><th class="num">余留</th><th class="num">实物库存</th></tr></thead><tbody>`;
+    for (const c of d.glass.colors) {
+      html += `<tr>
+        <td><span class="color-chip" style="background:${c.color}"></span>${c.color}</td>
+        <td class="num">${c.requiredSheets}</td>
+        <td class="num">${c.pickedSheets}</td>
+        <td class="num"><b>${c.remainingSheets}</b></td>
+        <td class="num">${c.stockSheets === null ? '—' : c.stockSheets}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+  }
+  const issues = d.issues || [];
+  html += `<h3>本单领料记录（${issues.length} 次，不可变、不可取消）</h3>`;
+  if (!issues.length) {
+    html += '<div class="hint">尚未领料。</div>';
+  } else {
+    html += '<ul class="issue-records">' + issues.map(issueRecordHtml).join('') + '</ul>';
+  }
+  el.innerHTML = html;
+}
+
+function issueRecordHtml(i) {
+  const typeZh = { lead_plan: '铅条计划', cut_order: '裁片订单', combo: '整套单' }[i.sourceType];
+  const parts = [];
+  if (i.leadBars > 0) parts.push(`铅条 <b>${i.leadBars}</b> 根`);
+  for (const g of i.glass) parts.push(`<span class="color-chip" style="background:${g.color}"></span>${g.color} <b>${g.count}</b> 张`);
+  return `<li><span class="badge ok">${typeZh}</span> <code>${escapeHtml(i.issueNo)}</code>
+    <span class="muted small">${i.issuedAt}</span><br>${parts.join('　') || '—'}</li>`;
+}
+
+async function issueSubmit() {
+  if (!issue.selectedId) { issueBanner('error', '⛔ 请先选择已确认单据'); return; }
+  const issueNo = document.getElementById('issueNo').value.trim();
+  if (!issueNo) { issueBanner('error', '⛔ 请填写唯一领料号（可点“生成领料号”）'); return; }
+  const body = { issueNo };
+  if (issue.sourceType !== 'cut_order') {
+    const v = Number(document.getElementById('issueLeadBars').value);
+    if (!Number.isInteger(v) || v < 0) { issueBanner('error', '⛔ 铅条根数必须是非负整数'); return; }
+    body.leadBars = v;
+  }
+  if (issue.sourceType !== 'lead_plan') {
+    const sheets = [];
+    document.querySelectorAll('[data-issue-sheet]').forEach((inp) => {
+      const n = Number(inp.value);
+      if (!Number.isInteger(n) || n < 0) {
+        throw new Error('玻璃张数必须是非负整数');
+      }
+      if (n > 0) sheets.push({ sheetId: Number(inp.dataset.issueSheet), count: n });
+    });
+    body.sheets = sheets;
+  }
+  const url = issue.sourceType === 'lead_plan'
+    ? `/api/plans/${issue.selectedId}/issues`
+    : issue.sourceType === 'cut_order'
+      ? `/api/cut-orders/${issue.selectedId}/issues`
+      : `/api/combo-orders/${issue.selectedId}/issues`;
+  try {
+    const data = await api('POST', url, body);
+    const i = data.issue;
+    const parts = [];
+    if (i.lead) parts.push(`铅条本次 ${i.lead.thisBars} / 累计 ${i.lead.pickedBars} / 余留 ${i.lead.remainingBars} 根`);
+    if (i.glass && i.glass.colors && i.glass.colors.some((c) => c.thisSheets > 0)) {
+      parts.push(i.glass.colors.filter((c) => c.thisSheets > 0)
+        .map((c) => `${c.color} 本次 ${c.thisSheets} / 累计 ${c.pickedSheets} / 余留 ${c.remainingSheets}`).join('；'));
+    }
+    issueBanner('success', (data.idempotent ? '该领料号已提交过：返回原记录（未再次扣减）。<br>' : '✓ 领料成功（库存与预留已在同一事务内核减）。<br>') +
+      parts.join('<br>'));
+    document.getElementById('issueNo').value = genIssueNo();
+    await issueLoadSources();
+    await issueLoadHistory();
+  } catch (err) {
+    const d = err.data || {};
+    let txt = '⛔ ' + (d.error || err.message);
+    if (d.code === 'invalid_issue' && Array.isArray(d.problems)) {
+      txt += '<br>' + d.problems.map((p) => escapeHtml(p.message)).join('<br>');
+      txt += '<br>整次领料未生效，库存未扣减。';
+    }
+    if (d.code === 'issue_no_conflict') txt += '；请更换领料号。';
+    issueBanner('error', txt);
+    await issueLoadSources();
+    await issueLoadHistory();
+  }
+}
+
+async function issueLoadHistory() {
+  const source = document.getElementById('issueFilter').value;
+  const data = await api('GET', '/api/issues' + (source ? `?source=${source}` : ''));
+  const el = document.getElementById('issueHistory');
+  if (!data.issues.length) { el.innerHTML = '<div class="hint">暂无领料记录。</div>'; return; }
+  el.innerHTML = '<ul class="issue-records">' + data.issues.map(issueRecordHtml).join('') + '</ul>';
+}
+
+document.getElementById('tabIssue').addEventListener('click', () => switchTab('issue'));
+document.getElementById('issueSourceType').addEventListener('change', issueLoadSources);
+document.getElementById('issueSourceSelect').addEventListener('change', issueSelectSource);
+document.getElementById('issueFilter').addEventListener('change', issueLoadHistory);
+document.getElementById('btnIssueSubmit').addEventListener('click', () => { issueSubmit().catch((e) => issueBanner('error', '⛔ ' + e.message)); });
+document.getElementById('btnIssueNewNo').addEventListener('click', () => {
+  document.getElementById('issueNo').value = genIssueNo();
+});

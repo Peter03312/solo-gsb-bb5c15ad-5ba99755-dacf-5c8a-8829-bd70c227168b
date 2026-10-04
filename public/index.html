@@ -18,6 +18,7 @@
       <button id="tabCutting" class="tab">玻璃裁片</button>
       <button id="tabCombo" class="tab">整套备料</button>
       <button id="tabStocktake" class="tab">库存盘点</button>
+      <button id="tabIssue" class="tab">领料</button>
     </nav>
   </header>
 
@@ -412,6 +413,62 @@
       <div class="lead-panel">
         <h2>盘点预览 / 盘点单详情</h2>
         <div id="stDetail" class="hint">在左侧勾选规格并录入实盘数，点击“预览盘点”。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ 领料视图 ============ -->
+  <main id="viewIssue" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>① 按单领料</h2>
+        <div class="hint">按已确认的独立铅条计划、独立裁片订单或整套用料单分次领料。数量为非负整数且至少一项大于 0，不能超过该单尚未领出的预留；整套单可只领其中一类。同一领料号重试返回原记录，内容不同报冲突。</div>
+        <label>领料来源
+          <select id="issueSourceType">
+            <option value="lead_plan">独立铅条计划</option>
+            <option value="cut_order">独立裁片订单</option>
+            <option value="combo">整套用料单</option>
+          </select>
+        </label>
+        <label>选择单据
+          <select id="issueSourceSelect"></select>
+        </label>
+        <label>唯一领料号
+          <input id="issueNo" type="text" placeholder="如 LL-20261004-001" maxlength="80">
+        </label>
+        <div id="issueLeadBox" class="form-row">
+          <label>本次铅条根数<input id="issueLeadBars" type="number" min="0" step="1" value="0"></label>
+        </div>
+        <div id="issueGlassBox">
+          <div class="hint">各色本次领取原片张数（0 表示本次不领该色）</div>
+          <div id="issueGlassInputs"></div>
+        </div>
+        <div class="btn-row">
+          <button id="btnIssueSubmit" class="primary big">确认领料（同事务扣减库存）</button>
+          <button id="btnIssueNewNo">生成领料号</button>
+        </div>
+        <div id="issueMsg" class="hint"></div>
+      </section>
+
+      <section>
+        <h2>② 领料历史</h2>
+        <label>筛选
+          <select id="issueFilter">
+            <option value="">全部</option>
+            <option value="lead_plan">独立铅条计划</option>
+            <option value="cut_order">独立裁片订单</option>
+            <option value="combo">整套用料单</option>
+          </select>
+        </label>
+        <div id="issueHistory"></div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="issueBanner" class="banner" hidden></div>
+      <div class="lead-panel">
+        <h2>单据剩余预留 / 领料详情</h2>
+        <div id="issueDetail" class="hint">在左侧选择已确认单据，查看各规格尚未领出的预留量并分次领料。</div>
       </div>
     </section>
   </main>
